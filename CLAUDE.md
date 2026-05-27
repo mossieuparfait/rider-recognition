@@ -34,45 +34,27 @@ courses ASO exposant `racecenter.<course>.fr/api/*`.
   rider-recognition reçoit la vidéo (NDI ou autre) et publie des métadonnées
   séparées.
 - **Aucun couplage repo** avec videoWan. Les deux projets vivent en parallèle.
-- **Course-agnostique dès la V1** : pas de constante "letour" hardcodée — un
-  paramètre `--race <slug>` qui choisit l'hôte racecenter.
-- **DB locale autonome** : la box doit pouvoir tourner offline une fois la DB
-  ingérée (race day = pas de dépendance au RTT internet).
-
-## Source données ASO
-
-API publique racecenter (sans auth, découverte 2026-05-27) :
-
-| Endpoint | Contenu |
-|---|---|
-| `/api/allCompetitors-<year>` | Coureurs (UCICode, idUCI, nom, dossard, 4 URLs photos) |
-| `/api/stage-<year>` | Étapes (parcours, départ, arrivée) |
-| `/api/team-<year>` | Équipes |
-| `/live-stream` | SSE temps réel (positions, écarts, vitesses) |
-| `/profils/<year>/profile-NN-<hash>.csv` | Profil altimétrique étape NN |
-
-CDN photos `img.aso.fr` public, paramétrable côté URL pour la taille/crop.
-
-Creds OAuth2 `directioncyclisme` (fichier hors-repo) probablement pour
-`api.aso.fr` (IP-whitelisté). Non utilisé en V1 — à creuser quand on aura le
-mail ASO d'origine.
+- **Ingest hors scope** : la BDD de référence (coureurs, photos, live timing)
+  est produite par une **app séparée du user**, ce repo ne consomme. Pas
+  d'appel direct aux APIs ASO ici, pas de crawler, pas de cache photo natif —
+  l'accès aux data sera fourni par le user (URL/format à documenter quand
+  reçu).
+- **Course-agnostique dès la V1** : pas de constante "letour" hardcodée.
 
 ## Layout (cible)
 
 ```
 cmd/
-  rider-ingest/    Pipeline ASO → DB locale
   rider-recog/     Reco visuelle (face + dossard + maillot) — GPU
-  rider-live/      Consumer SSE /live-stream
+  rider-live/      Consumer live timing (format fourni par l'app d'ingest)
 
-pkg/                Code partagé (clients ASO, schemas, etc.)
-
-data/               DB locale + cache photos (gitignore)
+pkg/                Code partagé (schemas data consommée, utils)
 deploy/             systemd units pour la box face-recog
 docs/               architecture, formats, etc.
 ```
 
-(Layout sera réajusté quand on aura tranché la stack — Python vs C++ vs mix.)
+(Layout sera réajusté quand on aura tranché la stack et le format d'accès
+aux data.)
 
 ## Conventions
 

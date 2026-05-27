@@ -8,27 +8,23 @@ indépendante d'AVtoWan (cf [[project_face_recog_box]]).
 
 ## Pipeline (cible)
 
-1. **Ingestion ASO** : `racecenter.<course>.fr/api/*` → DB locale riders + photos
-   référence (cache `img.aso.fr`).
-2. **Recognition visuelle** : face + dossard + maillot → bib/nom/équipe par
-   frame entrante.
-3. **Live timing overlay** : SSE `/live-stream` → position / écart / vitesse
-   exposés aux outils broadcast.
+1. **Recognition visuelle** : face + dossard + maillot → bib/nom/équipe par
+   frame entrante. GPU RTX 3080.
+2. **Live timing overlay** : consume position / écart / vitesse pour overlay
+   broadcast.
+
+L'**ingestion** des données coureurs / étapes / live timing n'est **pas**
+dans ce projet — elle est faite par une app séparée du user qui exposera
+ses accès. Ce repo est consommateur.
 
 Course-agnostique dès le départ (letour, paris-nice, dauphiné, vuelta,
 liège-bastogne-liège…).
 
-## Source données ASO
+## Source de données (en attente)
 
-API publique racecenter (sans auth) :
+L'ingest est externe. Le user fournira :
+- URL ou path d'accès à la base coureurs (nom, dossard, équipe, photos référence)
+- Format / schéma des données
+- Endpoint live timing à consommer
 
-| Endpoint | Contenu |
-|---|---|
-| `/api/allCompetitors-<year>` | Coureurs (UCICode, idUCI, nom, dossard, photos `img.aso.fr`) |
-| `/api/stage-<year>` | Étapes (parcours, départ, arrivée) |
-| `/api/team-<year>` | Équipes |
-| `/live-stream` | SSE temps réel (positions, écarts, vitesses) |
-| `/profils/<year>/profile-NN-<hash>.csv` | Profil altimétrique étape NN |
-
-Creds B2B `directioncyclisme` (cf `[secrets]`) probablement pour `api.aso.fr`
-(IP-whitelisté) — données enrichies non documentées, à creuser plus tard.
+À documenter ici une fois reçu.

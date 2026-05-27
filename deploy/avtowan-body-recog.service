@@ -1,0 +1,27 @@
+[Unit]
+Description=AVtoWan body recognition — YOLOv8-pose + BoT-SORT track
+After=network.target avtowan-face-recog.service
+Wants=avtowan-face-recog.service
+
+[Service]
+Type=simple
+User=ben
+Group=ben
+WorkingDirectory=/opt/rider-recognition
+
+# Defaults — override possible via /etc/avtowan/body-recog.env
+Environment=STREAM_URL=http://localhost:8810/stream.mjpeg
+Environment=OUTPUT_JSON=/tmp/avtowan-bodies.json
+Environment=BODY_PERIOD=0.1
+Environment=GPU_ID=0
+EnvironmentFile=-/etc/avtowan/body-recog.env
+
+ExecStart=/opt/rider-recognition/venv/bin/python3 /opt/rider-recognition/scripts/body_recog_service.py
+
+Restart=on-failure
+RestartSec=5
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

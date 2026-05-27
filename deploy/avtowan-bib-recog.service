@@ -1,0 +1,28 @@
+[Unit]
+Description=AVtoWan bib recognition — YOLOv8 person + PaddleOCR dossard
+After=network.target avtowan-face-recog.service
+Wants=avtowan-face-recog.service
+
+[Service]
+Type=simple
+User=ben
+Group=ben
+WorkingDirectory=/opt/rider-recognition
+
+# Defaults — override possible via /etc/avtowan/bib-recog.env
+Environment=STREAM_URL=http://localhost:8810/stream.mjpeg
+Environment=OUTPUT_JSON=/tmp/avtowan-bibs.json
+Environment=BIB_PERIOD=0.3
+Environment=RACE_JSON=/opt/rider-recognition/data/race_tdf2024_partants.json
+Environment=GPU_ID=0
+EnvironmentFile=-/etc/avtowan/bib-recog.env
+
+ExecStart=/opt/rider-recognition/venv/bin/python3 /opt/rider-recognition/scripts/bib_recog_service.py
+
+Restart=on-failure
+RestartSec=5
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

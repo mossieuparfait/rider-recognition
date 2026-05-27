@@ -101,7 +101,7 @@ def main() -> int:
             continue
 
         t0 = time.monotonic()
-        dets = rec.detect(frame)
+        dets, persons = rec.detect(frame)
         dt_ms = (time.monotonic() - t0) * 1000
 
         # Compose le JSON consommé par face_recog_service.
@@ -116,7 +116,16 @@ def main() -> int:
                 "person_bbox": list(d.person_bbox),
                 "bib_bbox": list(d.bib_bbox),
                 "confidence": d.confidence,
+                "track_id": d.track_id,
             })
+
+        # Personnes trackées (BoT-SORT) avec ou sans bib lu. Sert au
+        # tracking body côté face_recog.
+        persons_out = [{
+            "track_id": p.track_id,
+            "person_bbox": list(p.person_bbox),
+            "confidence": p.confidence,
+        } for p in persons]
 
         payload = {
             "ts": time.time(),
@@ -124,14 +133,15 @@ def main() -> int:
             "frame_h": frame.shape[0],
             "infer_ms": round(dt_ms, 1),
             "bibs": bibs_out,
+            "persons": persons_out,
         }
         write_atomic(OUTPUT_JSON, payload)
 
         n_done += 1
         if now - last_stats >= 5.0:
             log(f"{n_done / (now - last_stats):.1f} det/s, "
-                f"dernière : {len(bibs_out)} bibs en {dt_ms:.0f}ms "
-                f"({[b['bib'] for b in bibs_out]})")
+                f"dernière : {len(persons_out)} persons, {len(bibs_out)} bibs "
+                f"en {dt_ms:.0f}ms ({[b['bib'] for b in bibs_out]})")
             n_done = 0
             last_stats = now
 

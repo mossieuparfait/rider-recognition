@@ -29,12 +29,29 @@ class BibDetection:
     person_bbox : (x1,y1,x2,y2) de la personne englobante (pour matching face)
     bib       : numéro lu (int)
     confidence: score OCR [0..1]
+    track_id  : id stable cross-frames du body tracker BoT-SORT (None si
+                tracker n'a pas encore confirmé)
     """
 
     bib_bbox: tuple[int, int, int, int]
     person_bbox: tuple[int, int, int, int]
     bib: int
     confidence: float
+    track_id: int | None = None
+
+
+@dataclass
+class PersonTrack:
+    """Une personne détectée et trackée, SANS dossard lu.
+
+    Sert au tracking body : même si on n'a pas pu lire le bib, on a un
+    track_id stable qui permet à face_recog de maintenir l'ID d'une face
+    track associée quand le visage disparaît temporairement.
+    """
+
+    person_bbox: tuple[int, int, int, int]
+    track_id: int
+    confidence: float  # confidence YOLO person
 
 
 # Zone à OCR-iser : toute la personne + extension en bas pour capturer le
@@ -109,16 +126,23 @@ class BibRecognizer:
         )
 
     def detect(self, frame_bgr: np.ndarray,
-               verbose: bool = False) -> list[BibDetection]:
+               verbose: bool = False) -> tuple[list[BibDetection], list[PersonTrack]]:
         """Détecte personnes + OCR dossards sur la frame.
 
-        verbose=True : log tout ce que YOLO et OCR détectent avant filtres,
-        utile pour calibrer.
+        Retourne (bibs_lus, persons_trackées) :
+        - bibs_lus : un par personne dont l'OCR a sorti un numéro valide
+        - persons_trackées : TOUTES les personnes (même sans bib lu) avec
+          leur track_id BoT-SORT stable cross-frames. Sert au tracking
+          body côté face_recog quand le visage est temporairement caché.
+
+        verbose=True : log YOLO + OCR avant filtres.
         """
         out: list[BibDetection] = []
-        # YOLOv8 classes=[0] = 'person' (COCO).
-        results = self.yolo(frame_bgr, classes=[0], verbose=False,
-                            device=self._yolo_device)
+        persons: list[PersonTrack] = []
+        # YOLOv8 .track() avec persist=True = BoT-SORT cross-frames,
+        # sort un box.id stable. classes=[0] = 'person' (COCO).
+        results = self.yolo.track(frame_bgr, classes=[0], persist=True,
+                                  verbose=False, device=self._yolo_device)
         if not results:
             if verbose:
                 print("[bib_recog] YOLO: aucun résultat")
@@ -134,9 +158,10 @@ class BibRecognizer:
                 px1, py1, px2, py2 = box.xyxy[0].cpu().numpy().astype(int)
                 ph = py2 - py1
                 yolo_conf = float(box.conf[0])
+                track_id = int(box.id[0]) if box.id is not None else None
                 if verbose:
                     print(f"[bib_recog] person bbox=({px1},{py1},{px2},{py2}) "
-                          f"h={ph} conf={yolo_conf:.2f}")
+                          f"h={ph} conf={yolo_conf:.2f} track_id={track_id}")
                 if ph < _PERSON_MIN_H:
                     if verbose:
                         print(f"  → skip (h<{_PERSON_MIN_H} px)")
@@ -145,6 +170,16 @@ class BibRecognizer:
                     if verbose:
                         print(f"  → skip (yolo conf<{_PERSON_MIN_CONF})")
                     continue
+
+                # Publication du tracking body même si on n'a pas (encore)
+                # de bib lu — sert à face_recog pour maintenir l'ID quand
+                # le visage disparaît temporairement.
+                if track_id is not None:
+                    persons.append(PersonTrack(
+                        person_bbox=(int(px1), int(py1), int(px2), int(py2)),
+                        track_id=track_id,
+                        confidence=yolo_conf,
+                    ))
                 # Crop = personne entière + extension en bas pour capturer
                 # le dossard du cadre vélo (3ème occurrence du même numéro).
                 crop_y2 = min(fh, py2 + int(ph * _CROP_BOTTOM_EXTENSION))
@@ -204,13 +239,15 @@ class BibRecognizer:
                     person_bbox=(int(px1), int(py1), int(px2), int(py2)),
                     bib=bib,
                     confidence=chosen[1],
+                    track_id=track_id,
                 ))
                 if verbose:
-                    print(f"  ✓ retenu : #{bib} (vote {count}/{len(candidates)})")
+                    print(f"  ✓ retenu : #{bib} (vote {count}/{len(candidates)}) "
+                          f"track_id={track_id}")
         if verbose:
             print(f"[bib_recog] total YOLO persons={n_persons}, "
-                  f"dossards retenus={len(out)}")
-        return out
+                  f"trackées={len(persons)}, dossards retenus={len(out)}")
+        return out, persons
 
 
 def _cli() -> int:
@@ -234,9 +271,13 @@ def _cli() -> int:
     print("Inférence (verbose)...")
     import time
     t0 = time.time()
-    dets = rec.detect(img, verbose=True)
+    dets, persons = rec.detect(img, verbose=True)
     dt = (time.time() - t0) * 1000
-    print(f"\n{len(dets)} dossard(s) retenu(s) en {dt:.0f} ms")
+    print(f"\n{len(dets)} dossard(s) retenu(s), "
+          f"{len(persons)} personnes trackées en {dt:.0f} ms")
+    for d in dets:
+        print(f"  #{d.bib:>3}  conf={d.confidence:.2f}  bbox={d.bib_bbox}  "
+              f"person={d.person_bbox}  track_id={d.track_id}")
     for d in dets:
         print(f"  #{d.bib:>3}  conf={d.confidence:.2f}  bbox={d.bib_bbox}  person={d.person_bbox}")
     return 0

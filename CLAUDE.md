@@ -41,40 +41,54 @@ courses ASO exposant `racecenter.<course>.fr/api/*`.
 
 ## Accès à la data signatureNG
 
-**Dev (actuel)** : signatureNG est sur la **même machine**. Accès direct
-filesystem :
+**Dev (actuel)** : signatureNG est sur la **même machine**. Tout est dans
+`signature/public/data/rider_photos/` :
 
 ```
-signature/public/data/rider_photos/<UCIID>/<NN>_portrait_<TAG>.png
-  → 782 dossiers, 2320 photos, 226 MB (constaté 2026-05-27)
-  → UCIID = clé identité officielle UCI (11 chiffres)
-  → plusieurs photos par coureur, taggées par contexte (course+année)
+rider_photos/
+├── _manifest.json          ← source unique : 857 UCIIDs → {name, photos: [{race,type,url}]}
+├── 10048858880/
+│   ├── 01_podium_VUE2024.png
+│   ├── 02_podium_VUE2025.png
+│   ├── 03_portrait_VUE2024.png
+│   └── 04_portrait_VUE2025.png
+├── 10006895064/
+│   └── ...
+└── ...                     ← 782 dossiers physiques, 2320 photos, 226 MB
 ```
 
-Métadonnées riders (nom, équipe, etc.) : modèles Mongoose dans
-`signatureNG/signature/models/rider.js` + `team.js` + jointures.
+- `_manifest.json` est la **source de vérité** : `{uciid: {name, photos: [...]}}`
+- Le nom de fichier physique suit `<NN>_<type>_<RACE><YEAR>.png`
+  (type ∈ {`podium` 660×1000, `portrait` 400×400}, RACE ∈ {VUE, TDF, PRX, LBL, PN...})
+- Diff manifest (857) vs disque (782) : 75 UCIIDs indexés sans fichiers locaux
+  → à ignorer (skipper en chargement)
 
-**Prod (à venir)** : signatureNG migrera sur une autre machine du même LAN
-que le studio. Mode d'accès final non tranché — abstraire la source de data
-derrière une seule interface (un chargeur) pour pouvoir basculer
-local→HTTP/NFS sans toucher le code de reco. **Pas d'abstraction
-prématurée tant que dev local** : on commence avec un path en config, on
+Pas besoin de MongoDB, pas besoin de `test.json` (qui n'est qu'une course
+PN26 isolée — le manifest les couvre toutes).
+
+**Prod (à venir)** : signatureNG migrera sur autre machine du LAN studio.
+Mode d'accès final (API HTTP, NFS, rsync) à trancher à la migration. **Pas
+d'abstraction prématurée tant que dev local** : path en config, on
 basculera quand le déploiement le demandera.
 
-## Layout (cible)
+## Layout (Python)
 
 ```
-cmd/
-  rider-recog/     Reco visuelle (face + dossard + maillot) — GPU
-  rider-live/      Consumer live timing (format fourni par l'app d'ingest)
+rider_recognition/      package Python (code partagé)
+  __init__.py
+  dataset.py            charge _manifest.json + scanne rider_photos/
+  ...                   (embeddings, recog, etc. à venir)
 
-pkg/                Code partagé (schemas data consommée, utils)
-deploy/             systemd units pour la box face-recog
-docs/               architecture, formats, etc.
+scripts/                CLI / scripts utilitaires
+  scan_dataset.py       rapport sur le dataset disponible
+  ...
+
+deploy/                 systemd units pour la box face-recog (plus tard)
+docs/                   architecture, formats
 ```
 
-(Layout sera réajusté quand on aura tranché la stack et le format d'accès
-aux data.)
+Stack : **Python** (cohérent avec `avtowan-face-recog` côté videoWan,
+InsightFace/PyTorch/ONNX/TensorRT). Pas de C++ tant que pas besoin.
 
 ## Conventions
 

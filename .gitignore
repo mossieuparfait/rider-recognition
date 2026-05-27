@@ -1,0 +1,50 @@
+# Données et cache (jamais committés)
+/data/
+*.sqlite
+*.sqlite3
+*.db
+
+# Photos en cache (img.aso.fr CDN — re-téléchargeables)
+/cache/
+*.jpg.cache
+*.png.cache
+
+# Secrets (creds ASO B2B, tokens, etc.)
+*.env
+*.env.*
+!*.env.example
+secrets/
+dir.txt
+
+# Modèles ML (poids volumineux — gérés hors git)
+/models/
+*.onnx
+*.engine
+*.pt
+*.pth
+*.safetensors
+*.weights
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# C++ / build
+/build/
+/dist/
+*.o
+*.so
+*.a
+
+# Éditeurs
+.vscode/
+.idea/
+*.swp
+*~
+.DS_Store

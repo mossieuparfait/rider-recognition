@@ -20,11 +20,15 @@ ses accès. Ce repo est consommateur.
 Course-agnostique dès le départ (letour, paris-nice, dauphiné, vuelta,
 liège-bastogne-liège…).
 
-## Source de données (en attente)
+## Source de données
 
-L'ingest est externe. Le user fournira :
-- URL ou path d'accès à la base coureurs (nom, dossard, équipe, photos référence)
-- Format / schéma des données
-- Endpoint live timing à consommer
+Fournie par **signatureNG** (`/home/ben/AIlocal/signatureNG/`) — app
+signature ASO podium qui maintient déjà la BDD coureurs + photos.
 
-À documenter ici une fois reçu.
+**Dev (local) :**
+- Photos : `signature/public/data/rider_photos/<UCIID>/<NN>_portrait_<TAG>.png`
+  → 782 coureurs, 2320 photos, 226 MB
+- Métadonnées : MongoDB via models `signature/models/{rider,team,race}.js`
+
+**Prod (LAN) :** signatureNG sur autre machine du LAN studio. Mode d'accès
+(API HTTP / NFS / rsync) à trancher à la migration.

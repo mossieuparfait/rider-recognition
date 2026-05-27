@@ -35,11 +35,31 @@ courses ASO exposant `racecenter.<course>.fr/api/*`.
   séparées.
 - **Aucun couplage repo** avec videoWan. Les deux projets vivent en parallèle.
 - **Ingest hors scope** : la BDD de référence (coureurs, photos, live timing)
-  est produite par une **app séparée du user**, ce repo ne consomme. Pas
-  d'appel direct aux APIs ASO ici, pas de crawler, pas de cache photo natif —
-  l'accès aux data sera fourni par le user (URL/format à documenter quand
-  reçu).
+  est produite par **signatureNG** (`/home/ben/AIlocal/signatureNG/`). Pas
+  de re-scraping ici, pas d'appel direct aux APIs ASO.
 - **Course-agnostique dès la V1** : pas de constante "letour" hardcodée.
+
+## Accès à la data signatureNG
+
+**Dev (actuel)** : signatureNG est sur la **même machine**. Accès direct
+filesystem :
+
+```
+signature/public/data/rider_photos/<UCIID>/<NN>_portrait_<TAG>.png
+  → 782 dossiers, 2320 photos, 226 MB (constaté 2026-05-27)
+  → UCIID = clé identité officielle UCI (11 chiffres)
+  → plusieurs photos par coureur, taggées par contexte (course+année)
+```
+
+Métadonnées riders (nom, équipe, etc.) : modèles Mongoose dans
+`signatureNG/signature/models/rider.js` + `team.js` + jointures.
+
+**Prod (à venir)** : signatureNG migrera sur une autre machine du même LAN
+que le studio. Mode d'accès final non tranché — abstraire la source de data
+derrière une seule interface (un chargeur) pour pouvoir basculer
+local→HTTP/NFS sans toucher le code de reco. **Pas d'abstraction
+prématurée tant que dev local** : on commence avec un path en config, on
+basculera quand le déploiement le demandera.
 
 ## Layout (cible)
 

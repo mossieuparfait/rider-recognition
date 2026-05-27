@@ -1,111 +1,58 @@
 # CLAUDE.md
 
-Behavioral guidelines + project guide pour **rider-recognition**.
+## Comportement
 
-## Comportement attendu
+1. **Think before coding**, hypothèses énoncées.
+2. **Simplicity first** — minimum qui résout, pas d'abstraction prématurée.
+3. **Surgical changes**.
+4. **Critère de succès vérifiable** avant la première ligne.
 
-1. **Think before coding** : énoncer les hypothèses, ne pas en planquer. Si
-   plusieurs interprétations existent → demander, pas choisir en silence.
-2. **Simplicity first** : le minimum qui résout le problème. Pas de
-   "flexibilité" non demandée, pas d'abstraction prématurée.
-3. **Surgical changes** : ne toucher que ce qu'on doit. Pas de "j'en profite
-   pour refactor adjacent".
-4. **Goal-driven execution** : critère de succès vérifiable avant d'écrire la
-   première ligne.
+Code et CLI en **français**.
 
-Code commenté et messages CLI en **français**.
+## Scope (strict)
 
-## Projet
+**Reconnaissance de visage uniquement.** Rien d'autre :
 
-Reconnaissance visuelle de coureurs cyclistes pour overlay broadcast.
-Tourne sur la **box face-recog** (i3-12100 + RTX 3080 + 2.5 GbE), séparée
-d'AVtoWan.
+- ❌ Pas d'ingest de data (= autre projet, fournit déjà le dataset).
+- ❌ Pas de live timing.
+- ❌ Pas de multi-courses, pas de logique broadcast, pas d'overlay.
+- ✅ Charger un dataset déjà formaté `<PERSON>/photos.png` ou équivalent.
+- ✅ Calculer les embeddings ArcFace via InsightFace.
+- ✅ Produire un index `.npz` au format AVtoWan face-recog.
 
-Cible : à partir d'une frame vidéo entrante, identifier les coureurs visibles
-(nom + dossard + équipe) et fournir leur info live (écart, vitesse, position
-dans le peloton) à un outil broadcast (overlay, OSD, régie).
+## Outil existant à privilégier
 
-Course-agnostique : letour, paris-nice, dauphiné, vuelta, etc. — toutes les
-courses ASO exposant `racecenter.<course>.fr/api/*`.
+Avant d'écrire un nouveau script, vérifier
+`videoWan/cmd/avtowan-face-recog/index_faces.py` — il fait du
+`--db <dossier> --out <face-index.npz>` en une commande sur un dossier
+`<PERSON>/photos.*`. Pour les cas standard, c'est l'outil à utiliser
+directement, pas réinventer.
 
-## Principe architectural (à respecter)
+Ce repo n'apporte de la valeur que sur :
+- Datasets indexés par UCIID + lookup nom (signatureNG `_manifest.json`)
+- Multi-embedding par personne (matching plus robuste vs un mean seul)
 
-- **Box dédiée** : aucune cohabitation hot-path avec AVtoWan. La box
-  rider-recognition reçoit la vidéo (NDI ou autre) et publie des métadonnées
-  séparées.
-- **Aucun couplage repo** avec videoWan. Les deux projets vivent en parallèle.
-- **Ingest hors scope** : la BDD de référence (coureurs, photos, live timing)
-  est produite par **signatureNG** (`/home/ben/AIlocal/signatureNG/`). Pas
-  de re-scraping ici, pas d'appel direct aux APIs ASO.
-- **Course-agnostique dès la V1** : pas de constante "letour" hardcodée.
+Si la tâche c'est juste "indexer un dossier `<NOM>/photos`" → utiliser
+`index_faces.py` directement, sans toucher à ce repo.
 
-## Accès à la data signatureNG
-
-**Dev (actuel)** : signatureNG est sur la **même machine**. Tout est dans
-`signature/public/data/rider_photos/` :
+## Layout
 
 ```
-rider_photos/
-├── _manifest.json          ← source unique : 857 UCIIDs → {name, photos: [{race,type,url}]}
-├── 10048858880/
-│   ├── 01_podium_VUE2024.png
-│   ├── 02_podium_VUE2025.png
-│   ├── 03_portrait_VUE2024.png
-│   └── 04_portrait_VUE2025.png
-├── 10006895064/
-│   └── ...
-└── ...                     ← 782 dossiers physiques, 2320 photos, 226 MB
+rider_recognition/
+  dataset.py            charge signatureNG (_manifest.json + photos)
+scripts/
+  scan_dataset.py       rapport stats
+  build_index.py        embeddings ArcFace (1 par photo)
+  to_avtowan_format.py  conversion → format AVtoWan (mean par personne)
 ```
 
-- `_manifest.json` est la **source de vérité** : `{uciid: {name, photos: [...]}}`
-- Le nom de fichier physique suit `<NN>_<type>_<RACE><YEAR>.png`
-  (type ∈ {`podium` 660×1000, `portrait` 400×400}, RACE ∈ {VUE, TDF, PRX, LBL, PN...})
-- Diff manifest (857) vs disque (782) : 75 UCIIDs indexés sans fichiers locaux
-  → à ignorer (skipper en chargement)
+## Stack
 
-Pas besoin de MongoDB, pas besoin de `test.json` (qui n'est qu'une course
-PN26 isolée — le manifest les couvre toutes).
+Python + InsightFace + onnxruntime-gpu (déjà installés dans
+`/opt/avtowan-face-recog/venv` sur le studio). Réutiliser ce venv, ne
+pas en créer un autre.
 
-**Prod (à venir)** : signatureNG migrera sur autre machine du LAN studio.
-Mode d'accès final (API HTTP, NFS, rsync) à trancher à la migration. **Pas
-d'abstraction prématurée tant que dev local** : path en config, on
-basculera quand le déploiement le demandera.
-
-## Layout (Python)
-
-```
-rider_recognition/      package Python (code partagé)
-  __init__.py
-  dataset.py            charge _manifest.json + scanne rider_photos/
-  ...                   (embeddings, recog, etc. à venir)
-
-scripts/                CLI / scripts utilitaires
-  scan_dataset.py       rapport sur le dataset disponible
-  ...
-
-deploy/                 systemd units pour la box face-recog (plus tard)
-docs/                   architecture, formats
-```
-
-Stack : **Python** (cohérent avec `avtowan-face-recog` côté videoWan,
-InsightFace/PyTorch/ONNX/TensorRT). Pas de C++ tant que pas besoin.
-
-## Conventions
-
-- Pas de TODO non daté + assigné. Pas de commentaire `// legacy/deprecated`.
-- Chaque sous-`cmd/` a un README.md qui dit ce que fait le binaire.
-- Aucun secret committé (cf `.gitignore`).
-- Tests à côté du code (pas de `tests/` séparé).
-
-## Hardware cible
-
-- **Box face-recog** : i3-12100 + RTX 3080 + 2.5 GbE (cf [[project_face_recog_box]])
-- GPU compute : CUDA + (TensorRT si on optimise). Pas de partage avec d'autres
-  workloads tant que la box est dédiée broadcast.
-
-## Critères "propre" (à maintenir)
-
-- Aucun TODO sans owner + date.
-- Chaque ajout passe le critère "every changed line traces directly to the
-  user request".
-- Pipeline ingest reproductible (re-run idempotent).
+**Bootstrap CUDA obligatoire** dans tout script qui import onnxruntime :
+preload RTLD_GLOBAL des `.so` nvidia depuis `site-packages/nvidia/*/lib/`
+AVANT `import onnxruntime`, sinon fallback CPU silencieux (cf
+[[feedback_replicate_critical_patterns]]).

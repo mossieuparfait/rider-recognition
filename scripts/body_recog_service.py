@@ -29,6 +29,7 @@ from __future__ import annotations
 import json
 import os
 import sys
+import threading
 import time
 from pathlib import Path
 
@@ -36,6 +37,79 @@ import cv2
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
 from rider_recognition.body_recog import BodyRecognizer
+
+
+class MJPEGDrainer:
+    """Thread dédié à drainer le flux MJPEG en continu.
+
+    cv2.VideoCapture sur HTTP MJPEG bufferise en interne (libavformat)
+    indépendamment de CAP_PROP_BUFFERSIZE qui ne marche que sur V4L2.
+    Si le main loop d'inférence est plus lent que la prod (60 fps), le
+    backlog s'accumule → on lit du vieux contenu, retard de plusieurs
+    secondes.
+
+    Ce thread lit cap.read() AUSSI VITE que possible (= cadence MJPEG)
+    et stocke la dernière frame dans un slot 1-emplacement (drop-oldest).
+    Le main loop prend just la dernière dispo à son rythme.
+
+    Recovery : si le stream MJPEG crash ("Stream ends prematurely",
+    keep-alive cassé), reconstruit cap après N échecs consécutifs sinon
+    le drainer se fige sur une vieille frame et le main loop tourne en
+    boucle sur le même contenu (debug nightmare).
+    """
+
+    def __init__(self, url: str) -> None:
+        self.url = url
+        self.cap = self._open()
+        self._lock = threading.Lock()
+        self._frame = None
+        self._frame_ts = 0.0   # monotonic, dernière frame réussie
+        self._stop = threading.Event()
+        self._thread = threading.Thread(target=self._run, daemon=True,
+                                         name="mjpeg-drainer")
+        self._thread.start()
+
+    def _open(self) -> cv2.VideoCapture:
+        cap = cv2.VideoCapture(self.url)
+        cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+        return cap
+
+    def _run(self) -> None:
+        n_fail = 0
+        while not self._stop.is_set():
+            ok, frame = self.cap.read()
+            if not ok or frame is None:
+                n_fail += 1
+                time.sleep(0.05)
+                if n_fail >= 20:  # ~1s d'échec → reset stream
+                    log("drainer: stream cassé (20 reads failed), reconnect")
+                    try:
+                        self.cap.release()
+                    except Exception:
+                        pass
+                    self.cap = self._open()
+                    n_fail = 0
+                continue
+            n_fail = 0
+            with self._lock:
+                self._frame = frame
+                self._frame_ts = time.monotonic()
+
+    def get_latest(self, max_age_s: float | None = None):
+        """Retourne (frame, age_s). Si max_age_s est dépassé, retourne
+        (None, age) pour signaler au caller de skipper l'inférence."""
+        with self._lock:
+            f = self._frame
+            ts = self._frame_ts
+        if f is None:
+            return None, float("inf")
+        age = time.monotonic() - ts
+        if max_age_s is not None and age > max_age_s:
+            return None, age
+        return f, age
+
+    def stop(self) -> None:
+        self._stop.set()
 
 
 def env(name: str, default: str) -> str:
@@ -63,16 +137,13 @@ def main() -> int:
     log(f"init BodyRecognizer (YOLOv8-pose, gpu_id={GPU_ID})")
     rec = BodyRecognizer(gpu_id=GPU_ID)
 
-    log("ouverture du flux MJPEG")
-    cap = cv2.VideoCapture(STREAM_URL)
-    if not cap.isOpened():
-        log(f"FATAL: impossible d'ouvrir {STREAM_URL}")
-        return 1
-    cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+    log(f"ouverture drainer thread sur {STREAM_URL}")
+    drainer = MJPEGDrainer(STREAM_URL)
 
     next_run = 0.0
     n_done = 0
     last_stats = time.monotonic()
+    n_stale = 0
     while True:
         now = time.monotonic()
         sleep = next_run - now
@@ -80,14 +151,18 @@ def main() -> int:
             time.sleep(sleep)
         next_run = time.monotonic() + BODY_PERIOD
 
-        ok, frame = cap.read()
-        if not ok or frame is None:
-            log("frame illisible, retry dans 1s")
-            time.sleep(1)
-            cap.release()
-            cap = cv2.VideoCapture(STREAM_URL)
-            cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+        # Le drainer thread lit MJPEG aussi vite que possible et stocke
+        # la dernière frame ; on prend juste ça (zéro backlog). Si la
+        # frame est trop ancienne (> 2s), on skippe l'inférence pour ne
+        # pas publier du vieux contenu en boucle.
+        frame, age = drainer.get_latest(max_age_s=2.0)
+        if frame is None:
+            n_stale += 1
+            if n_stale % 20 == 0:
+                log(f"frame stale (age={age:.1f}s), skip inférence")
+            time.sleep(0.05)
             continue
+        n_stale = 0
 
         t0 = time.monotonic()
         persons = rec.detect(frame)

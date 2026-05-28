@@ -4,7 +4,10 @@
 
 [property]
 gpu-id=0
-model-engine-file=/work/engines/det_10g.fp16.engine
+# Build l'engine TRT depuis l'ONNX au 1er run (embed DS metadata pour
+# l'introspection des layers). Cache dans model-engine-file ensuite.
+onnx-file=/work/models/det_10g.onnx
+model-engine-file=/work/engines/det_10g_ds.fp16.engine
 infer-dims=3;640;640
 net-scale-factor=0.0078125
 offsets=127.5;127.5;127.5
@@ -15,3 +18,9 @@ output-tensor-meta=1
 cluster-mode=4
 batch-size=1
 gie-unique-id=1
+
+# Noms explicites des sorties pour que nvinfer puisse binder sans
+# introspection (l'engine TRT 10 ne contient pas les métadonnées DS).
+# Issus de trtexec --loadEngine. RetinaFace SCRFD = 3 échelles × 3 têtes
+# (scores, bbox, kps) = 9 sorties. Input auto-détecté via infer-dims.
+output-blob-names=448;471;494;451;474;497;454;477;500

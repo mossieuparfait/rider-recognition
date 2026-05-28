@@ -1,0 +1,40 @@
+# nvinfer config — RetinaFace det_10g (InsightFace buffalo_l detection)
+#
+# Convertit ONNX → TRT FP16 au 1er run dans engines/det_10g.fp16.engine.
+# Sortie : bboxes face + 5 landmarks par bbox + score.
+#
+# DET_SIZE 640 = config studio originelle stable.
+
+[property]
+gpu-id=0
+
+# Modèle source (ONNX). TRT engine sera build au boot, en cache après.
+onnx-file=/opt/face-recog-ds/models/det_10g.onnx
+model-engine-file=/opt/face-recog-ds/engines/det_10g.fp16.engine
+
+# Format input / output sortie RetinaFace SCRFD du buffalo_l.
+# Pré-traitement : resize 640x640, normalize (1/128, mean 127.5), BGR.
+infer-dims=3;640;640
+net-scale-factor=0.0078125
+offsets=127.5;127.5;127.5
+model-color-format=1
+
+# Précision FP16 (sm_86 = 3080, accélération massive vs FP32, perte
+# négligeable sur RetinaFace).
+network-mode=2
+
+# Detector (pas un classifier).
+network-type=100
+output-tensor-meta=1
+
+# Pas de clustering DBSCAN, on récupère raw outputs en metadata pour
+# parser nous-mêmes (RetinaFace n'est pas un détecteur "standard" YOLO).
+cluster-mode=4
+
+# Batch 1 pour l'instant (1 source NDI). Augmenter quand multi-cam.
+batch-size=1
+
+# Output blobs — RetinaFace SCRFD a plusieurs sorties (scores, bboxes,
+# kps à 3 échelles). Liste exacte à vérifier via Netron sur det_10g.onnx
+# au moment du build engine.
+# output-blob-names=448;471;494;451;474;497;454;477;500

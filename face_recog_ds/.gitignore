@@ -1,0 +1,5 @@
+# Generated TensorRT engines (large binaries, build-specific)
+engines/*.engine
+engines/*.plan
+# Copies temporaires de modèles
+*.onnx

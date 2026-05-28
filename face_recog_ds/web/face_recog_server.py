@@ -121,14 +121,22 @@ def bus_loop(pipeline: Gst.Pipeline, mainloop: GLib.MainLoop) -> None:
     bus = pipeline.get_bus()
     bus.add_signal_watch()
 
+    def restart_pipeline():
+        # NULL → PLAYING flush l'état du h265parse et reconnecte
+        # proprement udpsrc — utile quand la source live coupe.
+        print("[srv] restarting pipeline", flush=True)
+        pipeline.set_state(Gst.State.NULL)
+        pipeline.set_state(Gst.State.PLAYING)
+        return False  # one-shot
+
     def on_msg(_bus, msg):
         if msg.type == Gst.MessageType.ERROR:
             err, dbg = msg.parse_error()
             print(f"[srv] gst ERROR: {err.message} | {dbg}", flush=True)
-            mainloop.quit()
+            GLib.timeout_add_seconds(2, restart_pipeline)
         elif msg.type == Gst.MessageType.EOS:
-            print("[srv] gst EOS", flush=True)
-            mainloop.quit()
+            print("[srv] gst EOS — restart in 2s", flush=True)
+            GLib.timeout_add_seconds(2, restart_pipeline)
         elif msg.type == Gst.MessageType.WARNING:
             warn, dbg = msg.parse_warning()
             print(f"[srv] gst WARN: {warn.message}", flush=True)
@@ -148,22 +156,48 @@ INDEX_HTML = """<!DOCTYPE html>
          font-family: -apple-system, sans-serif; }
   header { padding: 8px 16px; background: #161b22;
            border-bottom: 1px solid #30363d;
-           display: flex; align-items: center; gap: 12px; }
-  header h1 { margin: 0; font-size: 14px; color: #a371f7; }
-  header .meta { font-size: 11px; color: #8b949e; }
-  main { display: flex; justify-content: center; padding: 8px; }
-  img { max-width: 100%; max-height: calc(100vh - 60px); }
+           display: flex; align-items: center; gap: 12px;
+           font-size: 12px; }
+  header h1 { margin: 0; font-size: 13px; color: #a371f7; }
+  header .meta { color: #8b949e; }
+  header .fps { color: #3fb950; margin-left: auto; }
+  main { display: flex; justify-content: center;
+         background: #0d1117; }
+  img { max-width: 100%; max-height: calc(100vh - 32px);
+        display: block; }
 </style>
 </head>
 <body>
 <header>
   <h1>arbox face-recog</h1>
-  <span class="meta">DeepStream 7.1 — YOLOv8L-Face + ArcFace + cublas matching</span>
-  <span class="meta">100% GPU pipeline</span>
+  <span class="meta">DeepStream 7.1 — YOLOv8L-Face + ArcFace + cublas</span>
+  <span class="fps" id="fps">— fps</span>
 </header>
 <main>
-  <img src="/stream.mjpeg" alt="live face-recog">
+  <img id="live" alt="live face-recog">
 </main>
+<script>
+  // Polling JPEG direct via <img src> — pattern le plus simple,
+  // marche sur tous les browsers, c'est le browser qui gère
+  // download + decode JPEG natif (zero traitement JS).
+  const img = document.getElementById('live');
+  const fpsEl = document.getElementById('fps');
+  let count = 0, lastSec = performance.now();
+
+  img.onload = () => {
+    count++;
+    const now = performance.now();
+    if (now - lastSec >= 1000) {
+      fpsEl.textContent = count + ' fps';
+      count = 0; lastSec = now;
+    }
+    next();
+  };
+  img.onerror = () => { setTimeout(next, 200); };
+
+  function next() { img.src = '/snapshot.jpg?t=' + Date.now(); }
+  next();
+</script>
 </body>
 </html>
 """.encode("utf-8")
@@ -173,6 +207,8 @@ BOUNDARY = b"avtowan-mjpeg"
 
 
 class Handler(BaseHTTPRequestHandler):
+    protocol_version = "HTTP/1.1"
+
     def log_message(self, fmt, *args):
         pass  # silence
 
@@ -181,6 +217,7 @@ class Handler(BaseHTTPRequestHandler):
             self.send_response(200)
             self.send_header("Content-Type", "text/html; charset=utf-8")
             self.send_header("Content-Length", str(len(INDEX_HTML)))
+            self.send_header("Connection", "close")
             self.end_headers()
             self.wfile.write(INDEX_HTML)
         elif self.path == "/healthz":
@@ -188,18 +225,43 @@ class Handler(BaseHTTPRequestHandler):
             self.send_response(200)
             self.send_header("Content-Type", "text/plain")
             self.send_header("Content-Length", str(len(body)))
+            self.send_header("Connection", "close")
             self.end_headers()
             self.wfile.write(body)
+        elif self.path == "/snapshot.jpg":
+            self._serve_snapshot()
         elif self.path == "/stream.mjpeg":
             self._serve_mjpeg()
         else:
             self.send_response(404)
+            self.send_header("Content-Length", "0")
+            self.send_header("Connection", "close")
             self.end_headers()
+
+    def _serve_snapshot(self):
+        # Renvoie le dernier JPEG en réponse one-shot — utile pour debug
+        # browser et pour les clients qui ne consomment pas MJPEG.
+        res = fbuf.wait_new(0, timeout=3.0)
+        if res is None:
+            self.send_response(503)
+            self.send_header("Content-Length", "0")
+            self.send_header("Connection", "close")
+            self.end_headers()
+            return
+        jpeg, _ = res
+        self.send_response(200)
+        self.send_header("Content-Type", "image/jpeg")
+        self.send_header("Content-Length", str(len(jpeg)))
+        self.send_header("Cache-Control", "no-store")
+        self.send_header("Connection", "close")
+        self.end_headers()
+        self.wfile.write(jpeg)
 
     def _serve_mjpeg(self):
         self.send_response(200)
         self.send_header("Cache-Control", "no-cache, private")
         self.send_header("Pragma", "no-cache")
+        self.send_header("Connection", "close")
         self.send_header(
             "Content-Type",
             f"multipart/x-mixed-replace; boundary={BOUNDARY.decode()}",

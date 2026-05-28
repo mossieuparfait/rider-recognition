@@ -1,0 +1,26 @@
+[Unit]
+Description=Studio HEVC sender — Magewell SDI → NVENC HEVC 50 Mbps → arbox
+# Conflit /dev/video0 avec avtowan-ndi-sender : ne peuvent pas tourner
+# en parallèle (V4L2 single-open). Faut stopper l'un pour démarrer
+# l'autre. Cette unité est designed pour le mode "face-recog arbox via
+# HEVC" actuel.
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+Environment=DST_HOST=192.168.1.175
+Environment=DST_PORT=5000
+Environment=BITRATE=50M
+Environment=DEVICE=/dev/video0
+EnvironmentFile=-/etc/avtowan/hevc-sender.env
+ExecStart=/usr/local/bin/avtowan-hevc-sender.sh
+Restart=on-failure
+RestartSec=3
+User=root
+SupplementaryGroups=video
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

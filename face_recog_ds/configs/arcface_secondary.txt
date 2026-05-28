@@ -23,12 +23,16 @@ infer-dims=3;112;112
 batch-size=16
 network-mode=2
 process-mode=2
-network-type=100
-output-tensor-meta=1
+# Classifier mode → nvinfer appelle notre custom parser pour chaque
+# crop face avec l'embedding 512-D en sortie. Le parser matche en VRAM
+# via cublas contre face-index.npz (782 sportifs) et écrit l'attribut
+# (name, score) que nvdsosd downstream affiche.
+network-type=1
+classifier-threshold=0.40
+parse-classifier-func-name=NvDsInferParseFaceMatch
+custom-lib-path=/work/plugins/face_match/libface_match.so
 gie-unique-id=2
 operate-on-gie-id=1
-# Skip les crops trop petits (face peu visible = embedding peu fiable).
 input-object-min-width=40
 input-object-min-height=40
-# Toutes les classes du primary (= 1 seule, "face").
 operate-on-class-ids=0

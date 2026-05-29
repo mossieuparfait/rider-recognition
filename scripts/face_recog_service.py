@@ -2963,7 +2963,16 @@ class MJPEGHandler(BaseHTTPRequestHandler):
                 buf.subscribers = max(0, buf.subscribers - 1)
 
     def do_GET(self):
-        if self.path == "/stream.mjpeg" or self.path == "/":
+        if self.path == "/" or self.path == "/index.html":
+            # Wrapper HTML fullscreen : <img> auto-scale viewport, fond
+            # noir, curseur masqué. Le browser décode le MJPEG natif.
+            self._serve_fullscreen("/stream.mjpeg", "face-recog")
+            return
+        elif self.path == "/skeleton" or self.path == "/skeleton.html":
+            self._serve_fullscreen("/stream-skeleton.mjpeg",
+                                   "face-recog skeleton")
+            return
+        elif self.path == "/stream.mjpeg":
             self._serve_mjpeg(self.fbuf)
             return
         elif self.path == "/stream-skeleton.mjpeg":
@@ -2977,6 +2986,32 @@ class MJPEGHandler(BaseHTTPRequestHandler):
         else:
             self.send_response(404)
             self.end_headers()
+
+    def _serve_fullscreen(self, stream_path: str, title: str) -> None:
+        html = (
+            "<!DOCTYPE html><html><head>"
+            f"<title>{title}</title>"
+            "<meta charset=\"utf-8\">"
+            "<meta name=\"viewport\" content=\"width=device-width,"
+            "initial-scale=1\">"
+            "<style>"
+            "html,body{margin:0;padding:0;height:100%;background:#000;"
+            "overflow:hidden;cursor:none;}"
+            "img{display:block;width:100vw;height:100vh;"
+            "object-fit:contain;}"
+            "</style></head><body>"
+            f"<img src=\"{stream_path}\" alt=\"\">"
+            "</body></html>"
+        ).encode("utf-8")
+        self.send_response(200)
+        self.send_header("Content-Type", "text/html; charset=utf-8")
+        self.send_header("Content-Length", str(len(html)))
+        self.send_header("Cache-Control", "no-store")
+        self.end_headers()
+        try:
+            self.wfile.write(html)
+        except (BrokenPipeError, ConnectionResetError):
+            pass
 
     def do_POST(self):
         if self.path == "/bullet-time":

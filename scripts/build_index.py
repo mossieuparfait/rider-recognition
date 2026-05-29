@@ -22,7 +22,7 @@ import sys
 import time
 from pathlib import Path
 
-# ── Bootstrap libs CUDA depuis le venv (cf face_recog_service.py AVtoWan) ──
+# ── Bootstrap libs CUDA depuis le venv ──
 # Sans dlopen RTLD_GLOBAL, onnxruntime CUDAExecutionProvider échoue à charger
 # libcublasLt.so.12 (livré dans site-packages/nvidia/cublas/lib/) et fallback
 # silencieusement sur CPU (~10× plus lent).

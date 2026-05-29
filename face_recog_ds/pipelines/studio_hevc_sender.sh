@@ -2,8 +2,8 @@
 # Studio HEVC sender — Magewell SDI /dev/video0 → NVENC HEVC Main10 50 Mbps
 # → MPEG-TS sur UDP vers arbox.
 #
-# Lance via systemd unit dédiée (ne pas exécuter en parallèle de
-# avtowan-ndi-sender = conflit /dev/video0).
+# Lance via systemd unit dédiée (ne pas exécuter en parallèle d'un
+# autre consommateur de /dev/video0 — V4L2 = single-open).
 #
 # Params NVENC tuned pour reconnaissance face broadcast :
 # - 50 Mbps CBR : niveau contribution broadcast, indiscernable du source

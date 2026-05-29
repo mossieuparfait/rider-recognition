@@ -14,7 +14,7 @@ WORK=/work
 export GST_PLUGIN_PATH=/opt/nvidia/deepstream/deepstream/lib/gst-plugins:/usr/lib/x86_64-linux-gnu/gstreamer-1.0
 export NDI_RUNTIME_DIR_V6=/opt/ndi-runtime
 
-NDI_SOURCE="${NDI_SOURCE:-STUDIO (AVtoWan-FaceRecog)}"
+NDI_SOURCE="${NDI_SOURCE:-FaceRecog-Source}"
 
 echo "[poc] NDI source: ${NDI_SOURCE}"
 echo "[poc] launching pipeline ndisrc → NVMM → nvinfer(retinaface) → fakesink"

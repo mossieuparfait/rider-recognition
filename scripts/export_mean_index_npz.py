@@ -1,20 +1,21 @@
 #!/usr/bin/env python3
-"""Convertit notre index multi-embedding vers le format AVtoWan face-recog.
+"""Convertit notre index multi-embedding vers un .npz "mean par personne".
 
-Format AVtoWan (cf videoWan/cmd/avtowan-face-recog/face_recog_service.py) :
+Format de sortie (générique, consommable par tout reconnaisseur ArcFace) :
     embeddings : (N, 512) float32, L2-normalisé
     names      : (N,)    str        une entrée par personne
 
-Notre format : 1 embedding PAR photo (donc plusieurs lignes par coureur).
-Conversion : on moyenne les embeddings d'un même UCIID puis on re-normalise L2.
+Notre format interne : 1 embedding PAR photo (donc plusieurs lignes par
+coureur). Conversion : on moyenne les embeddings d'un même UCIID puis on
+re-normalise L2.
 
 Nom final = "<Nom> (<UCIID>)" — garde l'UCIID pour traçabilité tout en
-affichant le nom humain dans la webui.
+affichant le nom humain côté consommateur.
 
 Usage:
-    python3 scripts/to_avtowan_format.py \\
+    python3 scripts/export_mean_index_npz.py \\
         --in data/embeddings.npz \\
-        --out /var/lib/avtowan/face-index.npz \\
+        --out /var/lib/rider-recognition/face-index.npz \\
         [--backup]
 """
 from __future__ import annotations
@@ -56,7 +57,7 @@ def convert(in_path: Path, out_path: Path, backup: bool = True) -> None:
         out_names.append(name_by_uciid[uciid])
 
     out_names_arr = np.array(out_names, dtype=object)
-    print(f"  → format AVtoWan : {out_embs.shape}, {len(out_names)} noms")
+    print(f"  → format mean-per-person : {out_embs.shape}, {len(out_names)} noms")
 
     # Backup si la cible existe déjà
     if backup and out_path.exists():

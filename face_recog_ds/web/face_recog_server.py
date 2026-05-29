@@ -203,7 +203,7 @@ INDEX_HTML = """<!DOCTYPE html>
 """.encode("utf-8")
 
 
-BOUNDARY = b"avtowan-mjpeg"
+BOUNDARY = b"rider-mjpeg"
 
 
 class Handler(BaseHTTPRequestHandler):

@@ -44,6 +44,6 @@ gst-launch-1.0 \
        ! "video/x-raw,format=I420" \
        ! jpegenc quality=80 \
        ! image/jpeg \
-       ! multipartmux boundary=avtowan-mjpeg \
+       ! multipartmux boundary=rider-mjpeg \
        ! tcpserversink host=0.0.0.0 port="${PREVIEW_PORT}" \
                        sync=false async=false

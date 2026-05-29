@@ -12,8 +12,7 @@ Layout output :
     names.txt      : 1 nom par ligne, ordre identique à embeddings.
 
 Usage :
-    convert_index.py /var/lib/face-recog/face-index.npz \\
-                     /opt/face-recog-ds/index/
+    convert_index.py <face-index.npz> <output-dir>
 """
 from __future__ import annotations
 

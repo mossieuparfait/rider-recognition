@@ -1,7 +1,5 @@
-# Aligné sur le venv /opt/avtowan-face-recog/venv déjà déployé sur le studio :
-#   insightface 1.0.1, onnxruntime-gpu 1.26.0 (TensorRT+CUDA), opencv 4.13.0.
-# Conservé pour traçabilité — pas besoin de pip install sur le studio,
-# réutiliser le venv existant.
+# Stack runtime : InsightFace ArcFace via onnxruntime-gpu (CUDA + TensorRT
+# si disponible), opencv pour I/O image.
 insightface>=1.0.1
 onnxruntime-gpu>=1.26.0
 opencv-python-headless>=4.9.0

@@ -1,14 +1,15 @@
 #!/usr/bin/env python3
 """bib_recog_service.py — consomme un flux MJPEG, détecte les dossards,
-publie un JSON consommé par face_recog_service.py AVtoWan.
+publie un JSON (chemin OUTPUT_JSON) consommable par tout client externe.
 
-Pourquoi un service séparé : torch (YOLO) et onnxruntime (InsightFace
-côté face-recog) ont des versions cuDNN qui conflictent dans le même
-process. On les sépare en 2 venvs / 2 processus, IPC via fichier JSON.
+Pourquoi un service séparé : torch (YOLO) et onnxruntime (InsightFace,
+souvent utilisé en aval pour la face-recog) ont des versions cuDNN qui
+conflictent dans le même process. On les sépare en 2 venvs / 2 processus,
+IPC via fichier JSON.
 
 Variables d'env :
     STREAM_URL    http://localhost:8810/stream.mjpeg   MJPEG à consommer
-    OUTPUT_JSON   /tmp/avtowan-bibs.json               état publié
+    OUTPUT_JSON   /tmp/rider-bibs.json                 état publié
     BIB_PERIOD    0.5                                  période détection (s)
     RACE_JSON     /home/ben/rider-recognition/data/race_tdf2024_partants.json
                                                        mapping bib→coureur
@@ -35,7 +36,7 @@ def env(name: str, default: str) -> str:
 
 
 STREAM_URL  = env("STREAM_URL", "http://localhost:8810/stream.mjpeg")
-OUTPUT_JSON = Path(env("OUTPUT_JSON", "/tmp/avtowan-bibs.json"))
+OUTPUT_JSON = Path(env("OUTPUT_JSON", "/tmp/rider-bibs.json"))
 BIB_PERIOD  = float(env("BIB_PERIOD", "0.5"))
 RACE_JSON   = Path(env(
     "RACE_JSON",

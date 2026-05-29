@@ -18,22 +18,17 @@ Code et CLI en **français**.
 - ❌ Pas de multi-courses, pas de logique broadcast, pas d'overlay.
 - ✅ Charger un dataset déjà formaté `<PERSON>/photos.png` ou équivalent.
 - ✅ Calculer les embeddings ArcFace via InsightFace.
-- ✅ Produire un index `.npz` au format AVtoWan face-recog.
+- ✅ Produire un index `.npz` (embeddings + names) consommable par tout
+  reconnaisseur ArcFace.
 
-## Outil existant à privilégier
+## Quand utiliser ce repo
 
-Avant d'écrire un nouveau script, vérifier
-`videoWan/cmd/avtowan-face-recog/index_faces.py` — il fait du
-`--db <dossier> --out <face-index.npz>` en une commande sur un dossier
-`<PERSON>/photos.*`. Pour les cas standard, c'est l'outil à utiliser
-directement, pas réinventer.
-
-Ce repo n'apporte de la valeur que sur :
+Apporte de la valeur seulement sur :
 - Datasets indexés par UCIID + lookup nom (signatureNG `_manifest.json`)
 - Multi-embedding par personne (matching plus robuste vs un mean seul)
 
-Si la tâche c'est juste "indexer un dossier `<NOM>/photos`" → utiliser
-`index_faces.py` directement, sans toucher à ce repo.
+Pour un cas standard "indexer un dossier `<NOM>/photos`", un outil
+généraliste type `insightface` CLI suffit — ce repo serait du surplus.
 
 ## Layout
 
@@ -41,16 +36,15 @@ Si la tâche c'est juste "indexer un dossier `<NOM>/photos`" → utiliser
 rider_recognition/
   dataset.py            charge signatureNG (_manifest.json + photos)
 scripts/
-  scan_dataset.py       rapport stats
-  build_index.py        embeddings ArcFace (1 par photo)
-  to_avtowan_format.py  conversion → format AVtoWan (mean par personne)
+  scan_dataset.py            rapport stats
+  build_index.py             embeddings ArcFace (1 par photo)
+  export_mean_index_npz.py   mean par personne → .npz (embeddings, names)
 ```
 
 ## Stack
 
-Python + InsightFace + onnxruntime-gpu (déjà installés dans
-`/opt/avtowan-face-recog/venv` sur le studio). Réutiliser ce venv, ne
-pas en créer un autre.
+Python + InsightFace + onnxruntime-gpu. Venv dédié `venv/` à la racine
+du repo (`python -m venv venv && venv/bin/pip install -r requirements.txt`).
 
 **Bootstrap CUDA obligatoire** dans tout script qui import onnxruntime :
 preload RTLD_GLOBAL des `.so` nvidia depuis `site-packages/nvidia/*/lib/`

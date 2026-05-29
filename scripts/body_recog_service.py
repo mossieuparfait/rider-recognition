@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """body_recog_service.py — consomme un flux MJPEG, extrait pose YOLOv8-pose,
-publie /tmp/avtowan-bodies.json consommé par face_recog_service AVtoWan.
+publie un JSON (chemin OUTPUT_JSON) consommable par tout client externe.
 
 Format JSON :
     {
@@ -20,7 +20,7 @@ Format JSON :
 
 Variables d'env :
     STREAM_URL    http://localhost:8810/stream.mjpeg
-    OUTPUT_JSON   /tmp/avtowan-bodies.json
+    OUTPUT_JSON   /tmp/rider-bodies.json
     BODY_PERIOD   0.1                     période détection (s, 10 fps)
     GPU_ID        -1                      -1=CPU, 0=cuda:0
 """
@@ -117,7 +117,7 @@ def env(name: str, default: str) -> str:
 
 
 STREAM_URL  = env("STREAM_URL", "http://localhost:8810/stream.mjpeg")
-OUTPUT_JSON = Path(env("OUTPUT_JSON", "/tmp/avtowan-bodies.json"))
+OUTPUT_JSON = Path(env("OUTPUT_JSON", "/tmp/rider-bodies.json"))
 BODY_PERIOD = float(env("BODY_PERIOD", "0.1"))
 GPU_ID      = int(env("GPU_ID", "-1"))
 

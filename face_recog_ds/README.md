@@ -1,13 +1,11 @@
 # face_recog_ds — DeepStream-based face-recog rewrite
 
 **Objectif** : pipeline 100% GPU/CUDA pour reconnaissance faciale broadcast
-sur arbox (RTX 3080). Remplace progressivement le service Python actuel
-(`videoWan/cmd/avtowan-face-recog/face_recog_service.py` + scripts
-`rider-recognition/scripts/{body,bib}_recog_service.py`) qui tourne en
-Python orchestré avec ses limitations CPU.
+sur arbox (RTX 3080). Remplace progressivement le pipeline Python
+orchestré (`scripts/{body,bib}_recog_service.py` + un consommateur
+externe d'index ArcFace), qui plafonne CPU.
 
-Décision actée le 2026-05-28 — cf
-[[project_face_recog_north_star]] mémoire.
+Décision actée le 2026-05-28.
 
 ## Stack engagée
 

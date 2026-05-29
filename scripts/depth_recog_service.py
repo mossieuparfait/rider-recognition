@@ -1,20 +1,19 @@
 #!/usr/bin/env python3
-"""depth_recog_service.py — DepthAnything-V2-Small en continu sur le MJPEG
-face_recog, publie une depth map fraîche pour le bullet-time.
+"""depth_recog_service.py — DepthAnything-V2-Small en continu sur un MJPEG,
+publie une depth map fraîche pour usage downstream (bullet-time, etc).
 
 Architecture :
 - Drainer thread lit le MJPEG en continu (drop-oldest, comme body_recog).
 - Main loop d'inférence à DEPTH_PERIOD (0.5s = 2 fps par défaut).
 - Écrit la depth en raw uint8 (.npy) + métadonnées JSON (path, ts, shape).
 
-Le face_recog consomme cette depth à la demande quand l'effet bullet-time
-est trigger (POST /bullet-time), freeze la frame courante, applique un
-warp parallax avec angle animé sur 2-3 sec.
+Un client externe peut consommer cette depth à la demande pour effets
+type freeze+parallax warp.
 
 Env :
     STREAM_URL       http://localhost:8810/stream.mjpeg
-    OUTPUT_NPY       /tmp/avtowan-depth.npy
-    OUTPUT_JSON      /tmp/avtowan-depth.json
+    OUTPUT_NPY       /tmp/rider-depth.npy
+    OUTPUT_JSON      /tmp/rider-depth.json
     DEPTH_PERIOD     0.5    (2 fps suffit, depth utilisée que sur freeze)
     GPU_ID           0
 """
@@ -39,8 +38,8 @@ def env(name: str, default: str) -> str:
 
 
 STREAM_URL   = env("STREAM_URL", "http://localhost:8810/stream.mjpeg")
-OUTPUT_NPY   = Path(env("OUTPUT_NPY", "/tmp/avtowan-depth.npy"))
-OUTPUT_JSON  = Path(env("OUTPUT_JSON", "/tmp/avtowan-depth.json"))
+OUTPUT_NPY   = Path(env("OUTPUT_NPY", "/tmp/rider-depth.npy"))
+OUTPUT_JSON  = Path(env("OUTPUT_JSON", "/tmp/rider-depth.json"))
 DEPTH_PERIOD = float(env("DEPTH_PERIOD", "0.5"))
 GPU_ID       = int(env("GPU_ID", "-1"))
 

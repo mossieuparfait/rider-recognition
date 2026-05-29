@@ -1,7 +1,6 @@
 [Unit]
-Description=AVtoWan depth estimation — DepthAnything-V2-Small (pour bullet-time)
-After=network.target avtowan-face-recog.service
-Wants=avtowan-face-recog.service
+Description=Rider depth estimation — DepthAnything-V2-Small (pour bullet-time)
+After=network.target
 
 [Service]
 Type=simple
@@ -10,11 +9,11 @@ Group=ben
 WorkingDirectory=/opt/rider-recognition
 
 Environment=STREAM_URL=http://localhost:8810/stream.mjpeg
-Environment=OUTPUT_NPY=/tmp/avtowan-depth.npy
-Environment=OUTPUT_JSON=/tmp/avtowan-depth.json
+Environment=OUTPUT_NPY=/tmp/rider-depth.npy
+Environment=OUTPUT_JSON=/tmp/rider-depth.json
 Environment=DEPTH_PERIOD=0.5
 Environment=GPU_ID=0
-EnvironmentFile=-/etc/avtowan/depth-recog.env
+EnvironmentFile=-/etc/rider-recognition/depth-recog.env
 
 ExecStart=/opt/rider-recognition/venv/bin/python3 /opt/rider-recognition/scripts/depth_recog_service.py
 

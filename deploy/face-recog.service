@@ -1,0 +1,73 @@
+[Unit]
+Description=Face recognition service — NDI in, InsightFace+Norfair, NDI out + MJPEG monitoring
+Documentation=https://github.com/anthropics/[project_face_recog_split]
+# Démarre une fois le réseau LAN up (sources NDI à découvrir) et le
+# driver NVIDIA chargé. Pas de dépendance dur sur body_recog / bib_recog
+# qui sont des services séparés (les JSON qu'ils écrivent sont consommés
+# best-effort, le service tourne sans).
+After=network-online.target nvidia-persistenced.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=ben
+Group=ben
+WorkingDirectory=/opt/face-recog
+
+# ─── Sources et sortie ────────────────────────────────────────────────
+# Source NDI : substring matching, "AVtoWan-FaceRecog" est le nom publié
+# par le ndi_sender côté studio. La box découvre via mDNS sur le LAN.
+Environment=SOURCE=ndi://AVtoWan-FaceRecog
+# Sortie NDI vers régie broadcast (annotated frames @ native res). Vide
+# = pas de NDI out, juste le MJPEG monitoring sur :8810.
+Environment=NDI_OUT_NAME=FaceRecog-Out
+# MJPEG monitoring port. /stream.mjpeg = vidéo annotée,
+# /stream-skeleton.mjpeg = squelette + photos.
+Environment=HTTP_PORT=8810
+
+# ─── Données face recognition ─────────────────────────────────────────
+Environment=INDEX=/var/lib/face-recog/face-index.npz
+Environment=PARTANTS_JSON=/var/lib/face-recog/partants.json
+Environment=RIDER_MANIFEST_JSON=/var/lib/face-recog/rider_manifest.json
+Environment=FACE_DB_DIR=/var/lib/face-recog/face-db
+Environment=SNAPSHOTS_DIR=/var/lib/face-recog/snapshots
+
+# ─── JSON externes (body_recog + bib_recog services séparés) ──────────
+# Best-effort : si pas de fichier ou stale, le service tourne sans.
+# Producteurs : bib-recog.service écrit /tmp/rider-bibs.json,
+# body-recog.service écrit /tmp/rider-bodies.json.
+Environment=BODIES_JSON=/tmp/rider-bodies.json
+Environment=BIBS_JSON=/tmp/rider-bibs.json
+
+# ─── Paramètres détection / tracking par défaut ───────────────────────
+Environment=DET_SIZE=640
+Environment=THRESHOLD=0.55
+Environment=GPU_ID=0
+Environment=TARGET_FPS=60
+Environment=DETECT_FPS=12
+Environment=PUBLISH_HEIGHT=720
+Environment=JPEG_QUALITY=80
+
+# ─── Active learning : OFF par défaut, opt-in via env override ────────
+Environment=SNAPSHOT_ENABLE=0
+
+# Override file pour les paramètres runtime sans toucher au unit.
+# Tous les knobs (LABEL_SMOOTH_ALPHA, MATCH_MIN_MARGIN, BODY_FACE_PULL_ALPHA,
+# etc.) sont ajustables ici sans rebuild.
+EnvironmentFile=-/etc/face-recog/face-recog.env
+
+ExecStart=/opt/face-recog/venv/bin/python /opt/face-recog/face_recog_service.py
+Restart=on-failure
+RestartSec=3
+StandardOutput=journal
+StandardError=journal
+
+# Hardening modéré : le service n'a besoin que de /var/lib/face-recog/
+# (RW) et lit /opt/face-recog/ (RO via WorkingDirectory).
+ReadWritePaths=/var/lib/face-recog /tmp
+ProtectHome=false
+ProtectSystem=full
+NoNewPrivileges=true
+
+[Install]
+WantedBy=multi-user.target

@@ -213,14 +213,15 @@ class Handler(BaseHTTPRequestHandler):
         pass  # silence
 
     def do_GET(self):
-        if self.path == "/" or self.path == "/index.html":
+        path = self.path.split("?", 1)[0]
+        if path == "/" or path == "/index.html":
             self.send_response(200)
             self.send_header("Content-Type", "text/html; charset=utf-8")
             self.send_header("Content-Length", str(len(INDEX_HTML)))
             self.send_header("Connection", "close")
             self.end_headers()
             self.wfile.write(INDEX_HTML)
-        elif self.path == "/healthz":
+        elif path == "/healthz":
             body = b"ok\n"
             self.send_response(200)
             self.send_header("Content-Type", "text/plain")
@@ -228,9 +229,9 @@ class Handler(BaseHTTPRequestHandler):
             self.send_header("Connection", "close")
             self.end_headers()
             self.wfile.write(body)
-        elif self.path == "/snapshot.jpg":
+        elif path == "/snapshot.jpg":
             self._serve_snapshot()
-        elif self.path == "/stream.mjpeg":
+        elif path == "/stream.mjpeg":
             self._serve_mjpeg()
         else:
             self.send_response(404)

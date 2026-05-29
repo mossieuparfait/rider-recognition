@@ -69,6 +69,60 @@ HTTP_PORT    = int(env("HTTP_PORT", "8810"))
 THRESHOLD    = float(env("THRESHOLD", "0.5"))
 DET_SIZE     = int(env("DET_SIZE", "640"))
 JPEG_QUALITY = int(env("JPEG_QUALITY", "80"))
+# Encode JPEG GPU (NVJPEG via ctypes, cf scripts/nvjpeg_encoder.py).
+# 0 = cv2.imencode CPU (~10 ms à 720p), 1 = NvJpegEncoder GPU (~1.5 ms).
+# Fallback automatique CPU si l'import ou l'init échoue.
+NVJPEG_ENABLED = bool(int(env("NVJPEG_ENABLED", "1")))
+
+# Compositing labels DERRIÈRE les riders via mask alpha publié par
+# avtowan-mask-recog.service (RVM matting GPU). Si actif :
+#   1. snapshot frame avant draw_tracks (= frame propre sans labels)
+#   2. draw_tracks dessine les labels sur frame
+#   3. ré-blend frame_orig au-dessus là où mask dit "rider" → label
+#      apparaît visuellement DERRIÈRE le rider.
+# Si mask absent ou stale → fallback no-op (labels au-dessus).
+MASK_BEHIND_LABELS = bool(int(env("MASK_BEHIND_LABELS", "0")))
+MASK_SHM_NAME = env("MASK_SHM_NAME", "avtowan-mask")
+MASK_STALE_MAX_AGE_S = float(env("MASK_STALE_MAX_AGE_S", "0.5"))
+
+# Rendu logo équipe derrière chaque coureur reconnu. Le logo est
+# composité semi-transparent sur la frame avant les labels, puis le
+# mask alpha (RVM) le cache là où le corps du coureur est devant →
+# logo apparaît comme posé sur le fond gris derrière le rider.
+# Scene logo (générique, indépendant des riders) — affiche UN logo à
+# position fixe sur l'écran, semi-transparent, derrière les personnes
+# (mask RVM cache les zones humaines). Cas type : logo course / partenaire
+# sur fond de plateau, à incruster sous des intervenants en présentation.
+SCENE_LOGO_BEHIND = bool(int(env("SCENE_LOGO_BEHIND", "0")))
+SCENE_LOGO_PATH = env("SCENE_LOGO_PATH", "/var/lib/avtowan/scene-logos/TDF.png")
+SCENE_LOGO_ALPHA = float(env("SCENE_LOGO_ALPHA", "0.45"))
+SCENE_LOGO_HEIGHT = int(env("SCENE_LOGO_HEIGHT", "500"))
+SCENE_LOGO_X_FRACTION = float(env("SCENE_LOGO_X_FRACTION", "0.5"))
+SCENE_LOGO_Y_FRACTION = float(env("SCENE_LOGO_Y_FRACTION", "0.45"))
+
+# Mode chroma-key : au lieu du mask RVM (qui rate les personnes en costume
+# / hors-rider), on calcule un mask par proximité de couleur au fond.
+# Le logo n'apparaît que là où le pixel courant est proche de la couleur
+# clé (= fond gris). Tout le reste reste visuellement devant le logo.
+SCENE_LOGO_CHROMA_KEY = bool(int(env("SCENE_LOGO_CHROMA_KEY", "0")))
+# Couleur clé en BGR (format "B,G,R"). 60,60,60 = gris foncé typique
+# backdrop studio. Adjust selon la scène.
+SCENE_LOGO_KEY_BGR = env("SCENE_LOGO_KEY_BGR", "60,60,60")
+# Distance euclidienne max au-delà de laquelle le pixel est considéré
+# "pas le fond". Soft band de 20 unités pour bords lisses.
+SCENE_LOGO_KEY_TOLERANCE = float(env("SCENE_LOGO_KEY_TOLERANCE", "35"))
+SCENE_LOGO_KEY_SOFTNESS = float(env("SCENE_LOGO_KEY_SOFTNESS", "20"))
+
+TEAM_LOGO_BEHIND = bool(int(env("TEAM_LOGO_BEHIND", "0")))
+TEAM_LOGOS_DIR = env("TEAM_LOGOS_DIR", "/var/lib/avtowan/team-logos")
+TEAM_LOGO_ALPHA = float(env("TEAM_LOGO_ALPHA", "0.5"))
+# Hauteur du logo en pixels (sur le frame natif, pré-resize).
+TEAM_LOGO_HEIGHT = int(env("TEAM_LOGO_HEIGHT", "400"))
+# Position FIXE du logo sur l'écran (pas par rider) : centré horizontalement
+# par défaut, fraction de la hauteur frame pour Y. Plusieurs équipes →
+# alignées en row centré.
+TEAM_LOGO_Y_FRACTION = float(env("TEAM_LOGO_Y_FRACTION", "0.4"))
+TEAM_LOGO_SPACING_PX = int(env("TEAM_LOGO_SPACING_PX", "60"))
 GPU_ID       = int(env("GPU_ID", "0"))
 # Modèle InsightFace : buffalo_l (default, ~280 MB VRAM, rapide, précision
 # correcte) ou antelopev2 (~600 MB VRAM, ~3× plus lent mais +30% précision
@@ -255,6 +309,20 @@ _MATCH_MIN_MARGIN = float(env("MATCH_MIN_MARGIN", "0.05"))
 # trop tôt si les samples récents convergent ailleurs. À 5 = re-vote ~2x
 # par seconde à DETECT_FPS=6.
 _REVOTE_INTERVAL = int(env("REVOTE_INTERVAL", "5"))
+# Stickiness du nom : au re-vote d'un track DÉJÀ résolu, on ne remplace
+# t.name que si new_score dépasse t.score d'au moins ce delta. Empêche
+# les riders pile au seuil de basculer entre 2 identités proches à chaque
+# re-vote (le margin_min filtre l'ambiguïté du match courant, pas la
+# concurrence vs le résultat précédent). 0.05 = exige une vraie domination
+# du nouveau, 0 = pas de stickiness (comportement historique).
+_NAME_SWITCH_MARGIN = float(env("NAME_SWITCH_MARGIN", "0.05"))
+# Lissage EMA du t.score affiché après résolution. Au re-vote :
+#   t.score = (1 - alpha) * t.score + alpha * new_score
+# 1.0 = pas de lissage (comportement historique, overwrite direct).
+# 0.4 = lisse ~3 re-votes, stabilise la zone autour du show_thresh pour
+# les borderline. Note : on lisse seulement si le nom ne change pas, sinon
+# on snap (changement d'identité = vrai jump, pas un lissage).
+_SCORE_SMOOTH_ALPHA = float(env("SCORE_SMOOTH_ALPHA", "0.4"))
 
 
 def log(msg: str) -> None:
@@ -313,6 +381,29 @@ class FaceIndex:
         else:
             margin = 0.0
         return (self.names[idx], top, margin)
+
+    def match_batch(self, embs: np.ndarray) -> list[tuple[str, float, float]]:
+        """Batch version : embs shape (K, 512), retourne K (name, top, margin).
+        Un seul np.dot pour tous → ~K× plus rapide que K appels individuels."""
+        if self.embeddings.shape[0] == 0 or len(embs) == 0:
+            return [("?", 0.0, 0.0)] * len(embs)
+        # sims shape (N_index, K)
+        sims = self.embeddings @ embs.T
+        idx = np.argmax(sims, axis=0)               # (K,)
+        top = sims[idx, np.arange(len(idx))]        # (K,)
+        out: list[tuple[str, float, float]] = []
+        if self.embeddings.shape[0] >= 2:
+            # Masque le top par colonne pour trouver le 2e best.
+            sims_masked = sims.copy()
+            sims_masked[idx, np.arange(len(idx))] = -2.0
+            second = sims_masked.max(axis=0)         # (K,)
+            margins = top - second
+        else:
+            margins = np.zeros(len(embs), dtype=np.float32)
+        for k in range(len(embs)):
+            out.append((self.names[int(idx[k])], float(top[k]),
+                         float(margins[k])))
+        return out
 
 
 # ──────────────────────── Bibs JSON (publié par bib_recog_service) ───
@@ -1159,8 +1250,20 @@ class NDIReceiver:
             )
         log(f"NDI : source trouvée = {target.name}")
 
+        # Format réception NDI :
+        #   BGRX_BGRA  : 4 bytes/pixel (alpha + BGR). Toujours dispo, mais
+        #                ~9% CPU en cv2.cvtColor(BGRA2BGR) sur la frame
+        #                (cf profile py-spy 2026-05-29).
+        #   UYVY_BGRA  : 2 bytes/pixel (YUV 4:2:2 packed) pour les sources
+        #                opaques (HB SpeedHQ est YUV natif). Memcpy moitié,
+        #                UYVY→BGR cv2 hautement vectorisé.
+        #   fastest    : laisse le SDK décider — typiquement UYVY pour HB.
+        # Env override pour bench/back-out facile.
+        recv_color_name = env("NDI_RECV_COLOR", "BGRX_BGRA")
+        recv_color = getattr(RecvColorFormat, recv_color_name,
+                              RecvColorFormat.BGRX_BGRA)
         self._receiver = Receiver(
-            color_format=RecvColorFormat.BGRX_BGRA,
+            color_format=recv_color,
             bandwidth=RecvBandwidth.highest,
         )
         self._receiver.set_source(target)
@@ -1358,8 +1461,30 @@ class SHMFramePublisher:
         self._shm = shared_memory.SharedMemory(
             create=True, size=size, name=name,
         )
+        # Workaround Python multiprocessing resource_tracker bug
+        # (https://bugs.python.org/issue38119) : SharedMemory(create=True)
+        # registre le segment auprès du resource_tracker daemon qui
+        # l'unlink agressivement (parfois immédiatement, parfois à l'exit
+        # d'un sous-process). Résultat : /dev/shm/<name> disparaît alors
+        # qu'on a encore le fd ouvert → les readers ne peuvent plus
+        # attacher. On unregister manuellement : le publisher gère son
+        # propre cleanup via close() explicite.
+        try:
+            from multiprocessing import resource_tracker
+            resource_tracker.unregister(self._shm._name, "shared_memory")
+        except Exception:
+            pass
         self._buf = self._shm.buf
         self._seq = 0
+        # Permet la lecture cross-user (face-recog tourne en root, des
+        # consommateurs comme avtowan-mask-recog.service tournent en ben).
+        # 0666 plutôt que 0664 car Python `shared_memory.SharedMemory(name=...)`
+        # ouvre toujours en O_RDWR, donc le reader a besoin de write perm
+        # même s'il ne fait que lire. SHM local sur machine dédiée → OK.
+        try:
+            os.chmod(f"/dev/shm/{name}", 0o666)
+        except OSError:
+            pass
         log(f"SHM publisher '{name}' ouvert : {size} bytes "
             f"(max {max_w}x{max_h}x3)")
 
@@ -1398,6 +1523,82 @@ class SHMFramePublisher:
             self._shm.unlink()
         except Exception:
             pass
+
+
+class SHMMaskReader:
+    """Reader seqlock du SHM mask alpha uint8 publié par avtowan-mask-recog.
+
+    Layout (cf mask_recog_service.py) :
+      0  seq u64    (impair = write in progress)
+      8  ts_ns u64
+      16 width u32
+      20 height u32
+      24 format u32 (0 = uint8 alpha)
+      28 reserved u32
+      32 raw uint8 alpha (w*h bytes)
+
+    Attache lazy au SHM ; renvoie None si segment absent (service mask
+    pas démarré) ou si frame trop ancienne (stale_max_age_s).
+    """
+
+    HEADER_SIZE = 32
+
+    def __init__(self, name: str, stale_max_age_s: float = 0.5) -> None:
+        self._name = name
+        self._shm = None
+        self._struct = __import__("struct")
+        self._stale_ns = int(stale_max_age_s * 1e9)
+        self._last_seq = 0
+
+    def _attach(self) -> bool:
+        if self._shm is not None:
+            return True
+        try:
+            from multiprocessing import shared_memory
+            self._shm = shared_memory.SharedMemory(name=self._name)
+            try:
+                from multiprocessing import resource_tracker
+                resource_tracker.unregister(self._shm._name, "shared_memory")
+            except Exception:
+                pass
+            return True
+        except FileNotFoundError:
+            return False
+        except Exception:
+            return False
+
+    def latest(self) -> "np.ndarray | None":
+        """Renvoie le dernier mask uint8 (H,W) ou None. Copie le contenu
+        pour ne pas dépendre du SHM buf après retour."""
+        if not self._attach():
+            return None
+        buf = self._shm.buf
+        for _ in range(8):
+            seq_a = self._struct.unpack_from("<Q", buf, 0)[0]
+            if seq_a & 1:
+                continue
+            if seq_a == 0:
+                return None  # publisher pas encore écrit
+            ts_ns, w, h, fmt, _ = self._struct.unpack_from(
+                "<QIIII", buf, 8)
+            if fmt != 0 or w == 0 or h == 0:
+                return None
+            n = w * h
+            if self.HEADER_SIZE + n > len(buf):
+                return None
+            mask = np.frombuffer(buf, dtype=np.uint8,
+                                  count=n, offset=self.HEADER_SIZE).reshape(h, w)
+            seq_b = self._struct.unpack_from("<Q", buf, 0)[0]
+            if seq_b != seq_a:
+                continue
+            # Stale check : si timestamp trop vieux, skip (= mask-recog
+            # ne suit plus le rythme, on préfère ne pas l'utiliser).
+            if self._stale_ns > 0:
+                if time.monotonic_ns() - ts_ns > self._stale_ns:
+                    return None
+            self._last_seq = seq_a
+            return mask.copy()
+        return None
 
 
 class NDIOutSender:
@@ -1471,9 +1672,108 @@ class NDIOutSender:
                 pass
 
 
+class _LoopingFileCapture:
+    """Duck-type cv2.VideoCapture pour un fichier vidéo en boucle.
+
+    Auto-rewind à EOF + throttle à la cadence native du fichier (sinon
+    read() retourne à la vitesse de décodage = des centaines de fps,
+    inutile et confondant pour le tracker). Sert au mode test studio
+    où on substitue un MP4 à la place de la capture SDI live.
+
+    Optionnel : start_s/end_s définissent une fenêtre [start, end[ dans
+    le fichier (en secondes). Hors fenêtre on rewind à start_s. Utile
+    pour boucler sur un segment intéressant en évitant intros/outros.
+    """
+
+    # Persistance position pour reprendre au même endroit après un
+    # restart service (workflow itératif : modif env → restart → on
+    # veut pas re-attendre la scène de test). État valide < 5 min,
+    # même path, dans la fenêtre [start, end[.
+    _STATE_PATH = "/var/lib/avtowan/playback_state.json"
+    _STATE_MAX_AGE_S = 300
+
+    def __init__(self, cap, path: str, fps: float,
+                 start_s: float = 0.0, end_s: float | None = None):
+        self._cap = cap
+        self._path = path
+        self._period = 1.0 / max(1.0, fps)
+        self._next_t = time.monotonic()
+        self._start_ms = max(0.0, start_s) * 1000.0
+        self._end_ms = (end_s * 1000.0) if (end_s is not None and end_s > 0) else None
+        self._last_save_t = time.monotonic()
+
+        resumed = self._try_resume()
+        if not resumed and self._start_ms > 0:
+            self._cap.set(cv2.CAP_PROP_POS_MSEC, self._start_ms)
+
+    def _try_resume(self) -> bool:
+        import json as _json
+        try:
+            with open(self._STATE_PATH) as f:
+                state = _json.load(f)
+            if state.get("path") != self._path:
+                return False
+            if time.time() - float(state.get("saved_at", 0)) > self._STATE_MAX_AGE_S:
+                return False
+            pos_ms = float(state["pos_ms"])
+            if pos_ms < self._start_ms:
+                return False
+            if self._end_ms is not None and pos_ms >= self._end_ms:
+                return False
+            self._cap.set(cv2.CAP_PROP_POS_MSEC, pos_ms)
+            log(f"resumed playback at {pos_ms/1000:.1f}s "
+                f"(state file < {self._STATE_MAX_AGE_S}s old)")
+            return True
+        except (OSError, ValueError, KeyError, TypeError):
+            return False
+
+    def _save_state(self) -> None:
+        import json as _json, tempfile, os as _os
+        try:
+            pos_ms = self._cap.get(cv2.CAP_PROP_POS_MSEC)
+            _os.makedirs(_os.path.dirname(self._STATE_PATH), exist_ok=True)
+            # Écriture atomique : write tmp + rename.
+            tmp = self._STATE_PATH + ".tmp"
+            with open(tmp, "w") as f:
+                _json.dump({"path": self._path,
+                             "pos_ms": pos_ms,
+                             "saved_at": time.time()}, f)
+            _os.replace(tmp, self._STATE_PATH)
+        except OSError:
+            pass
+
+    def isOpened(self) -> bool: return self._cap.isOpened()
+    def set(self, *args, **kw): return self._cap.set(*args, **kw)
+    def get(self, *args, **kw): return self._cap.get(*args, **kw)
+    def release(self): return self._cap.release()
+
+    def _rewind(self) -> None:
+        self._cap.set(cv2.CAP_PROP_POS_MSEC, self._start_ms)
+
+    def read(self):
+        now = time.monotonic()
+        if self._next_t > now:
+            time.sleep(self._next_t - now)
+        self._next_t = max(self._next_t + self._period, time.monotonic())
+        if self._end_ms is not None:
+            cur_ms = self._cap.get(cv2.CAP_PROP_POS_MSEC)
+            if cur_ms >= self._end_ms:
+                self._rewind()
+        ok, frame = self._cap.read()
+        if not ok or frame is None:
+            self._rewind()
+            ok, frame = self._cap.read()
+        # Persistance pos ~1×/s.
+        if now - self._last_save_t > 1.0:
+            self._last_save_t = now
+            self._save_state()
+        return ok, frame
+
+
 def open_source(spec: str):
     """Ouvre la source vidéo. Supporte :
       - 'v4l2:/dev/videoN'   → cv2.VideoCapture (Magewell, webcam, etc.)
+      - 'file:<path>'        → fichier vidéo en boucle (mode test)
       - 'ndi://<match>'      → NDIReceiver duck-typé (LAN NDI HB stream)
 
     Le receiver NDI cherche une source dont le name CONTIENT <match>
@@ -1502,6 +1802,22 @@ def open_source(spec: str):
         fps = cap.get(cv2.CAP_PROP_FPS)
         log(f"source v4l2 {dev} ouverte ({w}x{h} @ {fps:.1f}fps)")
         return cap
+    if spec.startswith("file:"):
+        path = spec[len("file:"):]
+        cap = cv2.VideoCapture(path, cv2.CAP_FFMPEG)
+        if not cap.isOpened():
+            sys.exit(f"FATAL: ouverture {path} échec (fichier absent ?)")
+        w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+        h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+        fps = cap.get(cv2.CAP_PROP_FPS) or 60.0
+        start_s = float(env("LOOP_START_S", "0"))
+        end_s_raw = env("LOOP_END_S", "")
+        end_s = float(end_s_raw) if end_s_raw else None
+        win_msg = (f", loop [{start_s:.1f}s, {end_s:.1f}s["
+                   if end_s is not None else
+                   (f", loop [{start_s:.1f}s, EOF[" if start_s > 0 else ", loop full"))
+        log(f"source file {path} ouverte ({w}x{h} @ {fps:.1f}fps{win_msg}+throttle)")
+        return _LoopingFileCapture(cap, path, fps, start_s=start_s, end_s=end_s)
     if spec.startswith("ndi://"):
         match = spec[len("ndi://"):]
         return NDIReceiver(match)
@@ -1575,6 +1891,11 @@ class CaptureWorker:
         self._frames_grabbed = 0
         self._shm_pub = shm_pub
         self._stop = threading.Event()
+        # Pause : si set, le worker arrête d'avancer la source (= freeze
+        # de la dernière frame). Le display thread continue à recevoir la
+        # même frame, donc détecteur + tracker tournent sur image figée.
+        # Utile pour tester en stop-action sur un fichier vidéo.
+        self._paused = threading.Event()
         self._thread = threading.Thread(target=self._run, daemon=True,
                                           name="face-recog-capture")
         self._thread.start()
@@ -1588,9 +1909,35 @@ class CaptureWorker:
     def stop(self) -> None:
         self._stop.set()
 
+    def is_paused(self) -> bool:
+        return self._paused.is_set()
+
+    def set_paused(self, paused: bool) -> None:
+        if paused:
+            self._paused.set()
+        else:
+            self._paused.clear()
+
     def _run(self) -> None:
         log("capture worker thread started")
         while not self._stop.is_set():
+            if self._paused.is_set():
+                # Pause : on n'avance pas la source, mais on continue
+                # à re-publier la dernière frame dans le SHM à ~20Hz pour
+                # que les consommateurs (mask-recog notamment) conservent
+                # leur cadence et ne tombent pas en stale. Sans ça, mask
+                # devient stale > MASK_STALE_MAX_AGE_S → TEAM_LOGO_BEHIND
+                # et MASK_BEHIND_LABELS tombent en no-mask en pause.
+                if self._shm_pub is not None:
+                    with self._lock:
+                        f = self._frame
+                    if f is not None:
+                        try:
+                            self._shm_pub.publish(f)
+                        except Exception as e:
+                            log(f"SHM publish err: {e}")
+                time.sleep(0.05)
+                continue
             ok, frame = self.cap.read()
             if not ok or frame is None:
                 time.sleep(0.02)
@@ -1749,6 +2096,342 @@ _FONT           = ImageFont.truetype(_FONT_PATH, _FONT_SIZE)
 # Police plus petite pour bib + code nationalité (chips secondaires).
 _FONT_SMALL_SIZE = 20
 _FONT_SMALL     = ImageFont.truetype(_FONT_PATH, _FONT_SMALL_SIZE)
+# Chrono overlay (bottom-right) — police monospace pour stabilité visuelle
+# (les digits ne dansent pas en largeur quand l'heure change).
+_FONT_CLOCK_SIZE = int(env("CLOCK_FONT_SIZE", "40"))
+_FONT_CLOCK_PATH = env("CLOCK_FONT_PATH",
+                       "/usr/share/fonts/truetype/dejavu/DejaVuSansMono-Bold.ttf")
+try:
+    _FONT_CLOCK = ImageFont.truetype(_FONT_CLOCK_PATH, _FONT_CLOCK_SIZE)
+except Exception:
+    _FONT_CLOCK = ImageFont.truetype(_FONT_PATH, _FONT_CLOCK_SIZE)
+
+# Cache chrono base (text → BGRA premul NON warpé). Re-rendu uniquement au
+# changement de seconde. Le warp dynamique se fait par-dessus avec cache
+# par bucket d'angle.
+_CLOCK_BASE_CACHE: tuple[str, np.ndarray] | None = None
+# Cache warp par bucket d'angle yaw (1° bucket = ~11 entrées pour une
+# oscillation ±5°). Invalidé quand la base change (= changement de seconde).
+_CLOCK_WARP_CACHE: dict[int, np.ndarray] = {}
+# Toggle + position + style 3D + animation.
+_CLOCK_ENABLED         = bool(int(env("CLOCK_ENABLED", "1")))
+_CLOCK_YAW_DEG         = float(env("CLOCK_YAW_DEG", "5.0"))
+_CLOCK_MARGIN_PX       = int(env("CLOCK_MARGIN_PX", "32"))
+# Animation continue (osc yaw + bob) — désactivée par défaut.
+_CLOCK_YAW_AMP_DEG     = float(env("CLOCK_YAW_AMP_DEG", "0.0"))
+_CLOCK_ORBIT_PERIOD_S  = float(env("CLOCK_ORBIT_PERIOD_S", "5.0"))
+_CLOCK_Y_BOB_AMP_PX    = int(env("CLOCK_Y_BOB_AMP_PX", "0"))
+# Mini-animation au tick seconde : la plaque arrive du dessus en
+# slide-down + fade-in, ease-out cubic pour qu'elle se pose doucement.
+# Durée typique 200-300ms ; 0 = pas d'animation.
+_CLOCK_TICK_DURATION_S = float(env("CLOCK_TICK_DURATION_S", "0.25"))
+_CLOCK_TICK_SLIDE_PX   = int(env("CLOCK_TICK_SLIDE_PX", "14"))
+# Instant (monotonic) où le texte courant est apparu pour la 1ère fois.
+# Utilisé pour calculer la progression de l'anim tick.
+_CLOCK_TICK_INSTANT: float | None = None
+_CLOCK_LAST_TEXT: str | None = None
+
+
+def _render_clock_card(text: str) -> Image.Image:
+    """Rend la plaque chrono PIL (RGBA) — gradient dark + bevel haut/bas
+    + drop shadow externe + texte blanc avec ombre portée interne. Pas de
+    warp ici, fait après par _orbital_warp."""
+    # Mesures texte.
+    bbox = _FONT_CLOCK.getbbox(text)
+    text_w = bbox[2] - bbox[0]
+    text_h = bbox[3] - bbox[1]
+    pad_x = 22
+    pad_y_top = 12
+    pad_y_bot = 14
+    radius = 16
+    shadow_off = 5  # offset du drop shadow externe
+
+    inner_w = text_w + 2 * pad_x
+    inner_h = pad_y_top + text_h + pad_y_bot
+
+    # Canvas avec marge pour le drop shadow.
+    canvas_w = inner_w + 2 * shadow_off
+    canvas_h = inner_h + 2 * shadow_off
+    img = Image.new("RGBA", (canvas_w, canvas_h), (0, 0, 0, 0))
+    draw = ImageDraw.Draw(img)
+
+    # 1. Drop shadow externe — rect flouté approximé via 2 passes
+    # alpha décroissantes (PIL n'a pas de blur direct sans Filter import).
+    shadow_x = shadow_off + shadow_off
+    shadow_y = shadow_off + shadow_off
+    draw.rounded_rectangle(
+        (shadow_x, shadow_y,
+         shadow_x + inner_w, shadow_y + inner_h),
+        radius=radius, fill=(0, 0, 0, 90),
+    )
+    draw.rounded_rectangle(
+        (shadow_x - 1, shadow_y - 1,
+         shadow_x + inner_w + 1, shadow_y + inner_h + 1),
+        radius=radius + 1, fill=(0, 0, 0, 40),
+    )
+
+    # 2. Fond principal — empilage 2 rects en couleurs proches pour faux
+    # gradient (haut un poil plus clair, bas plus sombre = profondeur).
+    x0 = shadow_off
+    y0 = shadow_off
+    x1 = x0 + inner_w
+    y1 = y0 + inner_h
+    # Couche bas (dark base).
+    draw.rounded_rectangle(
+        (x0, y0, x1, y1), radius=radius, fill=(20, 24, 34, 235),
+    )
+    # Couche haut (50% top, plus claire) — masquée par radius via clip
+    # implicite du rounded_rectangle (le coin bas-droit reste droit, OK
+    # car couvert visuellement par la couche bas dessous).
+    half_h = inner_h // 2
+    draw.rounded_rectangle(
+        (x0, y0, x1, y0 + half_h), radius=radius, fill=(38, 44, 56, 235),
+    )
+    # Trait fin séparation diffuse (alpha bas) — adoucit la transition
+    # entre les 2 demi-rects pour qu'on perçoive un gradient continu.
+    for k in range(4):
+        a = 60 - k * 12
+        if a <= 0:
+            break
+        draw.line(
+            (x0 + radius, y0 + half_h + k, x1 - radius, y0 + half_h + k),
+            fill=(28, 32, 42, a), width=1,
+        )
+
+    # 3. Bevel haut : ligne 1px brillante juste sous le bord supérieur,
+    # à l'intérieur de la carte → "lumière au-dessus".
+    draw.line(
+        (x0 + radius, y0 + 1, x1 - radius, y0 + 1),
+        fill=(255, 255, 255, 90), width=1,
+    )
+    # 4. Bevel bas : ligne 1px sombre au ras du bord inférieur → "ombre
+    # interne en bas". Ensemble = effet de plaque convexe.
+    draw.line(
+        (x0 + radius, y1 - 2, x1 - radius, y1 - 2),
+        fill=(0, 0, 0, 130), width=1,
+    )
+
+    # 5. Texte — drop shadow d'abord (offset 2px sombre), puis blanc.
+    tx = x0 + pad_x - bbox[0]
+    ty = y0 + pad_y_top - bbox[1]
+    draw.text((tx + 2, ty + 2), text, font=_FONT_CLOCK,
+              fill=(0, 0, 0, 220))
+    draw.text((tx, ty), text, font=_FONT_CLOCK,
+              fill=(245, 248, 255, 255))
+    return img
+
+
+def _clock_base(text: str) -> np.ndarray:
+    """Rend la plaque chrono BGRA prémultipliée NON warpée. Cache par
+    text (seconde). Invalide le cache de warp quand la base change."""
+    global _CLOCK_BASE_CACHE
+    if _CLOCK_BASE_CACHE is not None and _CLOCK_BASE_CACHE[0] == text:
+        return _CLOCK_BASE_CACHE[1]
+    card = _render_clock_card(text)
+    arr = np.array(card)
+    bgra = arr[:, :, [2, 1, 0, 3]].copy()
+    a = bgra[:, :, 3:4].astype(np.float32) * (1.0 / 255.0)
+    bgra[:, :, :3] = (bgra[:, :, :3].astype(np.float32) * a).astype(np.uint8)
+    _CLOCK_BASE_CACHE = (text, bgra)
+    _CLOCK_WARP_CACHE.clear()
+    return bgra
+
+
+def render_clock_overlay(now_s: float) -> tuple[np.ndarray, int]:
+    """Retourne (BGRA warpée, y_offset_anim) pour le timestamp donné.
+    yaw oscille en sin autour de CLOCK_YAW_DEG ± CLOCK_YAW_AMP_DEG sur la
+    période CLOCK_ORBIT_PERIOD_S. Bob vertical sin en quadrature pour ne
+    pas être en phase avec le yaw → mouvement organique non-mécanique."""
+    text = time.strftime("%H:%M:%S", time.localtime(now_s))
+    base = _clock_base(text)
+    # Phase orbite (s) au sein de la période courante.
+    phase = (now_s % _CLOCK_ORBIT_PERIOD_S) / _CLOCK_ORBIT_PERIOD_S
+    yaw = _CLOCK_YAW_DEG + _CLOCK_YAW_AMP_DEG * math.sin(
+        2.0 * math.pi * phase
+    )
+    # Bob vertical en quadrature (cos = sin décalé π/2).
+    y_off = int(round(_CLOCK_Y_BOB_AMP_PX * math.cos(
+        2.0 * math.pi * phase
+    )))
+    if abs(yaw) < 0.5:
+        return base, y_off
+    bucket = int(round(yaw))
+    cached = _CLOCK_WARP_CACHE.get(bucket)
+    if cached is None:
+        cached = _orbital_warp(base, float(bucket))
+        _CLOCK_WARP_CACHE[bucket] = cached
+    return cached, y_off
+
+
+def overlay_clock(frame_bgr: np.ndarray) -> None:
+    """Composite la plaque chrono animée dans le coin de la frame
+    in-place. Position contrôlée par CLOCK_POSITION env :
+    bl (default), br, tl, tr. Mini-animation slide-down + fade-in à
+    chaque tick seconde (ease-out cubic)."""
+    if not _CLOCK_ENABLED:
+        return
+    global _CLOCK_TICK_INSTANT, _CLOCK_LAST_TEXT
+    now_s = time.time()
+    text = time.strftime("%H:%M:%S", time.localtime(now_s))
+    now_mono = time.monotonic()
+    if text != _CLOCK_LAST_TEXT:
+        _CLOCK_LAST_TEXT = text
+        _CLOCK_TICK_INSTANT = now_mono
+    card, y_bob = render_clock_overlay(now_s)
+    h, w = frame_bgr.shape[:2]
+    ch, cw = card.shape[:2]
+    pos = env("CLOCK_POSITION", "bl").lower()
+    if pos == "br":
+        x = w - cw - _CLOCK_MARGIN_PX
+        y = h - ch - _CLOCK_MARGIN_PX
+    elif pos == "tl":
+        x = _CLOCK_MARGIN_PX
+        y = _CLOCK_MARGIN_PX
+    elif pos == "tr":
+        x = w - cw - _CLOCK_MARGIN_PX
+        y = _CLOCK_MARGIN_PX
+    else:  # bl par défaut
+        x = _CLOCK_MARGIN_PX
+        y = h - ch - _CLOCK_MARGIN_PX
+
+    # Calcul progression anim tick. p ∈ [0,1] ; ease-out cubic.
+    if (_CLOCK_TICK_DURATION_S > 0 and _CLOCK_TICK_INSTANT is not None):
+        elapsed = now_mono - _CLOCK_TICK_INSTANT
+        if elapsed < _CLOCK_TICK_DURATION_S:
+            p = elapsed / _CLOCK_TICK_DURATION_S
+            ease = 1.0 - (1.0 - p) ** 3  # ease-out cubic
+            # Slide-down : démarre au-dessus de y_target, atterrit en y_target.
+            y += -int(round(_CLOCK_TICK_SLIDE_PX * (1.0 - ease)))
+            # Fade-in : RGB et alpha multipliés par ease (card premul donc
+            # multiplie les 4 channels uniformément).
+            faded = (card.astype(np.float32) * ease).astype(np.uint8)
+            composite_bgra(frame_bgr, faded, x, y + y_bob)
+            return
+
+    composite_bgra(frame_bgr, card, x, y + y_bob)
+
+# Drapeau nationalité (PNG pré-rendus par scripts/download_flags.py dans
+# <FLAGS_DIR>/<IOC3>.png). Cache module-level, lazy-load, downscale à
+# _FLAG_TARGET_HW dans le label. Si manquant pour un code → pas de
+# drapeau, juste les autres sections (bib/nom/team) rendus normalement.
+_FLAGS_DIR        = Path(env("FLAGS_DIR", "/var/lib/face-recog/flags"))
+# Source des portraits riders. Priorité PORTRAIT_PHOTOS_DIR (dataset
+# face-recog dont l'index .npz a été construit — 100% des riders) puis
+# fallback FACE_DB_DIR (ASO subset partiel ~37%).
+_PORTRAIT_PHOTOS_DIR = Path(env("PORTRAIT_PHOTOS_DIR",
+                                 "/home/ben/rider_photos"))
+# Pré-warm cache portraits au boot pour éviter les spikes de disk-read
+# lors du 1er render de chaque label. Coût boot ~3-5 s, gain runtime
+# significatif.
+PORTRAIT_PREWARM = bool(int(env("PORTRAIT_PREWARM", "1")))
+# Pre-render TOUS les labels au boot (~15 ms × 198 = ~3 s boot, gain
+# runtime énorme — la revote loop devient lookup-only).
+LABEL_PRERENDER = bool(int(env("LABEL_PRERENDER", "1")))
+# Cache global name → BGRA premul des labels pré-rendus. Vide tant que
+# main() n'a pas tourné. NAME → ndarray.
+_LABEL_PRERENDER_CACHE: dict = {}
+_FLAG_TARGET_H    = int(env("FLAG_TARGET_H", "22"))  # px dans le label
+_FLAG_CACHE: dict[str, "Image.Image | None"] = {}
+
+
+_PORTRAIT_CACHE: dict[str, "Image.Image | None"] = {}
+_PORTRAIT_TARGET_H = int(env("PORTRAIT_TARGET_H", "38"))  # px (carré)
+
+
+def _load_portrait(uciid: str | None,
+                   target_h: int | None = None) -> "Image.Image | None":
+    """Retourne la photo portrait PIL Image RGBA carrée pour le rider, ou
+    None si manquante. Charge en PIL pur (pas cv2.imread qui jette l'alpha)
+    pour préserver le fond transparent des PNG ASO. target_h paramètre la
+    taille de sortie ; cache par (uciid, target_h)."""
+    if not uciid:
+        return None
+    h = target_h if target_h is not None else _PORTRAIT_TARGET_H
+    key = f"{uciid}@{h}"
+    if key in _PORTRAIT_CACHE:
+        return _PORTRAIT_CACHE[key]
+    # Cherche dans le dataset face-recog (100% des riders) puis fallback
+    # face-db ASO (subset partiel ~37%). Renvoie la 1ère trouvée.
+    folder = None
+    for candidate_root in (_PORTRAIT_PHOTOS_DIR, Path(FACE_DB_DIR)):
+        f = candidate_root / uciid
+        if f.is_dir():
+            folder = f
+            break
+    if folder is None:
+        _PORTRAIT_CACHE[key] = None
+        return None
+    candidate = None
+    # Priorité PNG (souvent avec alpha) puis fallback formats classiques.
+    for ext in ("png", "PNG", "webp", "jpg", "jpeg", "JPG"):
+        matches = sorted(folder.glob(f"*.{ext}"))
+        if matches:
+            candidate = matches[0]
+            break
+    if candidate is None:
+        _PORTRAIT_CACHE[key] = None
+        return None
+    try:
+        pil = Image.open(candidate).convert("RGBA")
+        # Crop carré : center horizontal, TOP pour les photos portrait
+        # (rider_photos ASO 660×1000 = full-body avec tête en haut → un
+        # center-crop coupait la tête). Pour les photos paysage (rare)
+        # on center-crop normalement.
+        s = min(pil.width, pil.height)
+        left = (pil.width - s) // 2
+        if pil.height > pil.width:
+            # Top-biased crop : on garde la tête + buste, on jette les jambes.
+            top = 0
+        else:
+            top = (pil.height - s) // 2
+        pil = pil.crop((left, top, left + s, top + s))
+        pil = pil.resize((h, h), Image.LANCZOS)
+        _PORTRAIT_CACHE[key] = pil
+        return pil
+    except Exception:
+        _PORTRAIT_CACHE[key] = None
+        return None
+
+
+def _placeholder_rank_text(name: str) -> tuple[str, str]:
+    """Placeholder rang + gap temps tant qu'on n'a pas de feed live. Stable
+    par rider (hash du nom) pour des valeurs cohérentes frame-à-frame.
+    Format : ("#16", "+12'55\""). À remplacer par une vraie source GC
+    (JSON live ASO/PCS) quand dispo."""
+    import hashlib
+    h = int(hashlib.md5(name.encode("utf-8")).hexdigest()[:8], 16)
+    rank = (h % 198) + 1  # 1..198 (taille peloton TDF)
+    if rank == 1:
+        return "#1", "+0\""
+    gap_total_s = (h >> 8) % 7200  # 0..2h, déterministe
+    gap_m = gap_total_s // 60
+    gap_s = gap_total_s % 60
+    return f"#{rank}", f"+{gap_m}'{gap_s:02d}\""
+
+
+def _load_flag(iso3: str | None) -> "Image.Image | None":
+    """Retourne le drapeau PIL Image RGBA pour le code IOC, ou None.
+    Cache positif et négatif (un manque ne re-tente pas chaque frame)."""
+    if not iso3:
+        return None
+    key = iso3.upper()
+    if key in _FLAG_CACHE:
+        return _FLAG_CACHE[key]
+    path = _FLAGS_DIR / f"{key}.png"
+    if not path.is_file():
+        _FLAG_CACHE[key] = None
+        return None
+    try:
+        img = Image.open(path).convert("RGBA")
+        # Downscale au target height en gardant ratio (ex: 40x30 → ~30x22).
+        ratio = _FLAG_TARGET_H / img.height
+        new_w = max(1, int(round(img.width * ratio)))
+        img = img.resize((new_w, _FLAG_TARGET_H), Image.LANCZOS)
+        _FLAG_CACHE[key] = img
+        return img
+    except Exception:
+        _FLAG_CACHE[key] = None
+        return None
 
 
 # ─────────────────────── Métadonnées riders (bib + nation) ─────────────
@@ -1826,56 +2509,38 @@ def load_riders_meta(json_path: str | None) -> dict[str, dict]:
     return out
 
 
-def render_lower_third(name: str, score: float,
-                       bib: int | None = None,
-                       nationality: str | None = None,
-                       bib_confirmed: bool = False) -> np.ndarray:
-    """Rend un label broadcast lower-third pour un nom donné.
+_LABEL_SIMPLE = bool(int(env("LABEL_SIMPLE", "0")))
 
-    Layout horizontal, neutre (pas de couleur dépendante du score) :
-      [ bib  │  NAME  │  NAT ]
 
-    - bib : entier en texte clair sur le fond sombre, visible uniquement
-      si fourni.
-    - NAME : texte blanc gras (police principale).
-    - NAT : code pays 3 lettres en texte clair, visible uniquement si
-      fourni.
-    - Séparateurs verticaux fins entre sections présentes.
-
-    Format display name : "Firstname LASTNAME" tel quel (l'index face-db
-    stocke déjà sous cette forme). Si underscores présents (cas folders
-    legacy), on les convertit en espaces.
-
-    Renvoie un BGRA numpy array (h, w, 4) prêt à composite sur frame BGR.
-    """
+def _render_lower_third_simple(name: str,
+                                bib: int | None,
+                                team_or_nat: str | None,
+                                bib_confirmed: bool) -> np.ndarray:
+    """Version studio-like : [bib | NAME | team/nat] 1 ligne, pas de
+    portrait ni flag. Beaucoup moins de composite/render = équivalent au
+    code studio mai 27. Sert quand LABEL_SIMPLE=1."""
     display = name.replace("_", " ")
-
-    # Mesures du texte principal (nom).
     bbox_txt = _FONT.getbbox(display)
     text_w = bbox_txt[2] - bbox_txt[0]
     text_h = bbox_txt[3] - bbox_txt[1]
 
-    # Mesures bib + nationalité (police petite). Puce "•" avant le bib
-    # uniquement si confirmé par OCR cross-check (signal subtil de
-    # match face↔OCR vérifié, pas de couleur).
     bib_prefix = "• " if (bib is not None and bib_confirmed) else ""
     bib_str = f"{bib_prefix}{bib}" if bib is not None else ""
-    nat_str = nationality.upper() if nationality else ""
+    nat_str = team_or_nat.upper() if team_or_nat else ""
     bib_text_w = (_FONT_SMALL.getbbox(bib_str)[2]
                   - _FONT_SMALL.getbbox(bib_str)[0]) if bib_str else 0
     nat_text_w = (_FONT_SMALL.getbbox(nat_str)[2]
                   - _FONT_SMALL.getbbox(nat_str)[0]) if nat_str else 0
 
-    pad_x          = 16
-    pad_y_top      = 8
-    pad_y_bottom   = 8
-    radius         = 14
-    arrow_w        = 12
-    arrow_h        = 10
-    section_gap    = 12  # espace de chaque côté d'un séparateur
-    sep_w          = 1   # largeur du séparateur vertical
+    pad_x = 16
+    pad_y_top = 8
+    pad_y_bottom = 8
+    radius = 14
+    arrow_w = 12
+    arrow_h = 10
+    section_gap = 12
+    sep_w = 1
 
-    # Composition horizontale (largeurs additionnées des sections présentes).
     sections_w = text_w
     if bib_text_w:
         sections_w += bib_text_w + section_gap + sep_w + section_gap
@@ -1886,55 +2551,225 @@ def render_lower_third(name: str, score: float,
     h_label = pad_y_top + text_h + pad_y_bottom
     h = h_label + arrow_h
 
-    img  = Image.new("RGBA", (w, h), (0, 0, 0, 0))
+    img = Image.new("RGBA", (w, h), (0, 0, 0, 0))
     draw = ImageDraw.Draw(img)
-
-    # Fond principal (ombre + carte).
     draw.rounded_rectangle((1, 2, w - 1, h_label),
-                           radius=radius, fill=(0, 0, 0, 60))      # ombre
+                           radius=radius, fill=(0, 0, 0, 60))
     draw.rounded_rectangle((0, 0, w - 2, h_label - 1),
-                           radius=radius, fill=(15, 18, 26, 140))  # fond
+                           radius=radius, fill=(15, 18, 26, 140))
 
     cursor_x = pad_x
-    # Y aligné sur le texte du nom (les chips secondaires sont centrés
-    # verticalement sur la même ligne de texte).
     name_text_y = pad_y_top - 2
     small_text_y = pad_y_top + (text_h - _FONT_SMALL_SIZE) // 2 - 1
     sep_top = pad_y_top + 2
     sep_bot = h_label - pad_y_bottom - 2
 
-    # 1. Bib à gauche (texte simple + séparateur après).
     if bib_text_w:
-        draw.text(
-            (cursor_x, small_text_y),
-            bib_str, font=_FONT_SMALL, fill=(235, 235, 240, 255),
-        )
+        draw.text((cursor_x, small_text_y), bib_str, font=_FONT_SMALL,
+                  fill=(235, 235, 240, 255))
         cursor_x += bib_text_w + section_gap
-        draw.rectangle(
-            (cursor_x, sep_top, cursor_x + sep_w, sep_bot),
-            fill=(255, 255, 255, 90),
-        )
+        draw.rectangle((cursor_x, sep_top, cursor_x + sep_w, sep_bot),
+                       fill=(255, 255, 255, 90))
         cursor_x += sep_w + section_gap
 
-    # 2. Nom (centre).
     draw.text((cursor_x + 1, name_text_y + 1), display, font=_FONT,
-              fill=(0, 0, 0, 200))                                # drop shadow
-    draw.text((cursor_x,     name_text_y),     display, font=_FONT,
+              fill=(0, 0, 0, 200))
+    draw.text((cursor_x, name_text_y), display, font=_FONT,
               fill=(255, 255, 255, 255))
     cursor_x += text_w
 
-    # 3. Séparateur + code pays à droite.
     if nat_text_w:
         cursor_x += section_gap
+        draw.rectangle((cursor_x, sep_top, cursor_x + sep_w, sep_bot),
+                       fill=(255, 255, 255, 90))
+        cursor_x += sep_w + section_gap
+        draw.text((cursor_x, small_text_y), nat_str, font=_FONT_SMALL,
+                  fill=(220, 220, 230, 240))
+
+    arrow_top = h_label - 1
+    cx_arrow = (w - 2) // 2
+    draw.polygon([
+        (cx_arrow - arrow_w // 2, arrow_top),
+        (cx_arrow + arrow_w // 2, arrow_top),
+        (cx_arrow, arrow_top + arrow_h),
+    ], fill=(15, 18, 26, 140))
+
+    arr = np.array(img)
+    bgra = arr[:, :, [2, 1, 0, 3]].copy()
+    a = bgra[:, :, 3:4].astype(np.float32) * (1.0 / 255.0)
+    bgra[:, :, :3] = (bgra[:, :, :3].astype(np.float32) * a).astype(np.uint8)
+    return bgra
+
+
+def render_lower_third(name: str, score: float,
+                       bib: int | None = None,
+                       nationality: str | None = None,
+                       bib_confirmed: bool = False,
+                       country_iso3: str | None = None,
+                       uciid: str | None = None,
+                       team_name: str | None = None) -> np.ndarray:
+    if _LABEL_SIMPLE:
+        return _render_lower_third_simple(
+            name, bib,
+            nationality,  # = team_code passé par le caller
+            bib_confirmed,
+        )
+    """Rend un label broadcast lower-third 2 lignes pour un nom donné.
+
+    Layout :
+      ┌─────────┬──────────────────────────┐
+      │         │ bib  NAME            🇫🇷 │
+      │ PHOTO   ├──────────────────────────┤
+      │         │ Team Name      #16 +0'30"│
+      └─────────┴──────────────────────────┘
+              ▼ (flèche vers le visage)
+
+    Ligne 1 : bib (petit) + NAME (gros) + drapeau (à droite)
+    Ligne 2 : nom équipe complet (gauche) + classement+gap (droite, or)
+    Photo : pleine hauteur du label, carrée.
+
+    `nationality` est sémantiquement le team_code dans les appels actuels
+    (libre placeholder côté gauche : ce param est inert dans la nouvelle
+    version 2-lignes, conservé pour compat de signature).
+    """
+    display = name.replace("_", " ")
+    _ = nationality  # kept for caller compat, unused (was team_code 3-letter)
+
+    # ── Mesures texte ──
+    bbox_name = _FONT.getbbox(display)
+    name_w = bbox_name[2] - bbox_name[0]
+    name_h = bbox_name[3] - bbox_name[1]
+
+    bib_prefix = "• " if (bib is not None and bib_confirmed) else ""
+    bib_str = f"{bib_prefix}{bib}" if bib is not None else ""
+    bib_w = (_FONT_SMALL.getbbox(bib_str)[2]
+             - _FONT_SMALL.getbbox(bib_str)[0]) if bib_str else 0
+
+    team_str = (team_name or "").strip()
+    team_w = (_FONT_SMALL.getbbox(team_str)[2]
+              - _FONT_SMALL.getbbox(team_str)[0]) if team_str else 0
+
+    rank_str, gap_str = _placeholder_rank_text(name)
+    rank_text = f"{rank_str} {gap_str}"
+    rank_w = (_FONT_SMALL.getbbox(rank_text)[2]
+              - _FONT_SMALL.getbbox(rank_text)[0])
+
+    # ── Drapeau (taille fixe par le loader) ──
+    flag_img = _load_flag(country_iso3)
+    flag_w = flag_img.width if flag_img is not None else 0
+
+    # ── Constantes layout ──
+    pad_x          = 16
+    pad_y_top      = 10
+    pad_y_bottom   = 10
+    pad_inter      = 5  # gap entre ligne 1 et ligne 2
+    radius         = 14
+    arrow_w        = 12
+    arrow_h        = 10
+    section_gap    = 10
+    sep_w          = 1
+
+    # ── Hauteurs de lignes ──
+    line1_h = max(name_h, flag_img.height if flag_img else 0,
+                  _FONT_SMALL_SIZE)
+    line2_h = _FONT_SMALL_SIZE + 2
+    content_h = line1_h + pad_inter + line2_h
+
+    # ── Portrait à hauteur du bloc texte (carré). ──
+    portrait = _load_portrait(uciid, target_h=content_h)
+    portrait_w = portrait.width if portrait is not None else 0
+
+    # ── Largeurs des 2 lignes pour caler le bloc texte ──
+    line1_inner_w = name_w
+    if bib_w:
+        line1_inner_w += bib_w + section_gap
+    if flag_w:
+        line1_inner_w += section_gap + flag_w
+
+    # Ligne 2 : team gauche, rank droite, gap minimal entre les 2 si
+    # les 2 sont présents.
+    if team_w and rank_w:
+        line2_inner_w = team_w + section_gap * 2 + rank_w
+    else:
+        line2_inner_w = team_w + rank_w
+
+    text_block_w = max(line1_inner_w, line2_inner_w)
+
+    # ── Largeur totale de la carte ──
+    sections_w = text_block_w
+    if portrait_w:
+        sections_w += portrait_w + section_gap + sep_w + section_gap
+
+    w = sections_w + 2 * pad_x
+    h_label = pad_y_top + content_h + pad_y_bottom
+    h = h_label + arrow_h
+
+    img  = Image.new("RGBA", (w, h), (0, 0, 0, 0))
+    draw = ImageDraw.Draw(img)
+
+    # ── Fond principal (ombre + carte) ──
+    draw.rounded_rectangle((1, 2, w - 1, h_label),
+                           radius=radius, fill=(0, 0, 0, 60))
+    draw.rounded_rectangle((0, 0, w - 2, h_label - 1),
+                           radius=radius, fill=(15, 18, 26, 140))
+
+    cursor_x = pad_x
+    sep_top = pad_y_top + 2
+    sep_bot = h_label - pad_y_bottom - 2
+
+    # 1. Portrait full-height à gauche + séparateur. Paste avec masque
+    # alpha (portrait est RGBA) → le fond transparent des PNG ASO laisse
+    # voir le fond dark du label, pas de carré greenish/blanc.
+    if portrait is not None:
+        portrait_y = pad_y_top + (content_h - portrait.height) // 2
+        img.paste(portrait, (cursor_x, portrait_y), portrait)
+        cursor_x += portrait.width + section_gap
         draw.rectangle(
             (cursor_x, sep_top, cursor_x + sep_w, sep_bot),
             fill=(255, 255, 255, 90),
         )
         cursor_x += sep_w + section_gap
-        draw.text(
-            (cursor_x, small_text_y),
-            nat_str, font=_FONT_SMALL, fill=(220, 220, 230, 240),
-        )
+
+    text_block_x = cursor_x
+
+    # ── Ligne 1 : bib | NAME | flag (centré verticalement sur line1) ──
+    line1_y_center = pad_y_top + line1_h // 2
+
+    cx = text_block_x
+    if bib_w:
+        bib_y = line1_y_center - _FONT_SMALL_SIZE // 2 - 1
+        draw.text((cx, bib_y), bib_str, font=_FONT_SMALL,
+                  fill=(235, 235, 240, 255))
+        cx += bib_w + section_gap
+
+    name_y = line1_y_center - name_h // 2 - 2
+    # Drop shadow + NAME blanc.
+    draw.text((cx + 1, name_y + 1), display, font=_FONT,
+              fill=(0, 0, 0, 200))
+    draw.text((cx, name_y), display, font=_FONT,
+              fill=(255, 255, 255, 255))
+    cx += name_w
+
+    # Drapeau aligné à droite de la ligne 1 si possible, sinon directement
+    # après le nom.
+    if flag_img is not None:
+        right_aligned_x = text_block_x + text_block_w - flag_img.width
+        flag_x = max(cx + section_gap, right_aligned_x)
+        flag_y = line1_y_center - flag_img.height // 2
+        img.paste(flag_img, (flag_x, flag_y), flag_img)
+
+    # ── Ligne 2 : team gauche + rank droite ──
+    line2_y_center = pad_y_top + line1_h + pad_inter + line2_h // 2
+    line2_text_y = line2_y_center - _FONT_SMALL_SIZE // 2 - 1
+    line2_right_x = text_block_x + text_block_w
+
+    if team_w:
+        draw.text((text_block_x, line2_text_y), team_str,
+                  font=_FONT_SMALL, fill=(200, 205, 220, 240))
+
+    if rank_w:
+        draw.text((line2_right_x - rank_w, line2_text_y), rank_text,
+                  font=_FONT_SMALL, fill=(255, 220, 100, 255))
 
     # Flèche fine vers le visage, centrée sous la carte.
     arrow_top = h_label - 1
@@ -1951,13 +2786,35 @@ def render_lower_third(name: str, score: float,
     _ = score
 
     arr = np.array(img)
-    return arr[:, :, [2, 1, 0, 3]].copy()
+    bgra = arr[:, :, [2, 1, 0, 3]].copy()
+    # Pré-multiplication alpha : RGB *= A/255, alpha inchangé. Indispensable
+    # pour que cv2.warpPerspective (INTER_LINEAR) ne crée pas de frange
+    # sombre aux bords arrondis — sans premul, les samples border (R=G=B=0,
+    # A=0) tirent les pixels d'arête vers le noir tandis que l'alpha
+    # diminue indépendamment, ce qui produit un halo qui "respire" en sync
+    # avec l'oscillation yaw → flicker visible sur le contour de la box.
+    # Avec premul, la même interpolation produit un dégradé propre.
+    a = bgra[:, :, 3:4].astype(np.float32) * (1.0 / 255.0)
+    bgra[:, :, :3] = (bgra[:, :, :3].astype(np.float32) * a).astype(np.uint8)
+    return bgra
 
 
 def composite_bgra(frame_bgr: np.ndarray, label_bgra: np.ndarray,
-                    x: int, y: int) -> None:
+                    x: int, y: int,
+                    mask: "np.ndarray | None" = None) -> None:
     """Alpha-blend in-place du label_bgra sur frame_bgr à position (x, y).
-    Clip aux limites du frame."""
+
+    Suppose label_bgra à alpha PRÉ-MULTIPLIÉ (RGB déjà × A/255). Cf
+    render_lower_third. Le compositing devient :
+        dst = src_rgb + (1 - src_alpha) * dst
+    (= "source over" classique en premul). Clip aux limites du frame.
+
+    Si `mask` (uint8 0..255 même H,W que frame) est fourni, l'alpha du
+    label est modulé par (1 - mask/255) : là où mask=255 (rider plein),
+    le label devient invisible ; là où mask=0 (background), le label
+    est compositée normalement. Single-pass sur la ROI du label
+    seulement, donc ~20× moins de pixels que blender full-frame.
+    """
     lh, lw = label_bgra.shape[:2]
     fh, fw = frame_bgr.shape[:2]
     # Clip rect destination.
@@ -1970,8 +2827,216 @@ def composite_bgra(frame_bgr: np.ndarray, label_bgra: np.ndarray,
     lx1 = lx0 + (x1 - x0); ly1 = ly0 + (y1 - y0)
     roi   = frame_bgr[y0:y1, x0:x1]
     label = label_bgra[ly0:ly1, lx0:lx1]
-    alpha = label[:, :, 3:4].astype(np.float32) * (1.0 / 255.0)
-    roi[:] = (alpha * label[:, :, :3] + (1.0 - alpha) * roi).astype(np.uint8)
+    label_alpha_norm = label[:, :, 3:4].astype(np.float32) * (1.0 / 255.0)
+    if mask is not None:
+        # Modulate label alpha by (1 - mask/255) → label "derrière" rider.
+        mask_roi = mask[y0:y1, x0:x1].astype(np.float32) * (1.0 / 255.0)
+        label_alpha_norm = label_alpha_norm * (1.0 - mask_roi[..., None])
+    # `label[:, :, :3]` est pré-multiplié par alpha 0..1, donc on doit
+    # le ré-échelle si on module l'alpha :
+    #   contribution = label_rgb_premult * (label_alpha_eff / label_alpha_orig)
+    # Plus simple : reconstruire le rgb non-premultiplié × nouvel alpha.
+    if mask is not None:
+        label_alpha_orig = label[:, :, 3:4].astype(np.float32) * (1.0 / 255.0)
+        # Évite div par 0 quand label transparent
+        safe_orig = np.maximum(label_alpha_orig, 1e-3)
+        label_rgb_unpremult = label[:, :, :3].astype(np.float32) / safe_orig
+        label_contrib = label_rgb_unpremult * label_alpha_norm
+    else:
+        label_contrib = label[:, :, :3].astype(np.float32)
+    inv_a = 1.0 - label_alpha_norm
+    roi[:] = (label_contrib + inv_a * roi).astype(np.uint8)
+
+
+# ──────────────────────── Team logos (rendu derrière riders) ─────────────
+_team_logo_cache: dict = {}
+
+
+def _load_team_logo_raw(team_code: str) -> "np.ndarray | None":
+    """Charge le PNG logo équipe (BGRA). None si absent."""
+    if not team_code:
+        return None
+    path = Path(TEAM_LOGOS_DIR) / f"{team_code}.png"
+    if not path.is_file():
+        return None
+    img = cv2.imread(str(path), cv2.IMREAD_UNCHANGED)
+    if img is None:
+        return None
+    if img.ndim == 2:
+        img = cv2.cvtColor(img, cv2.COLOR_GRAY2BGRA)
+    elif img.shape[2] == 3:
+        # PNG sans alpha → alpha 255 partout
+        alpha = np.full(img.shape[:2], 255, dtype=np.uint8)
+        img = np.dstack([img, alpha])
+    return img
+
+
+def get_team_logo_sized(team_code: str, target_h: int) -> "np.ndarray | None":
+    """Renvoie le logo BGRA pre-multiplié alpha, redimensionné à target_h
+    (largeur proportionnelle), avec TEAM_LOGO_ALPHA appliqué.
+
+    Bucketise target_h par tranche de 32 pour limiter les entrées cache.
+    Cache None pour les codes absents (évite re-lookup disque).
+    """
+    bucket_h = (target_h // 32) * 32 or 32
+    key = (team_code, bucket_h)
+    if key in _team_logo_cache:
+        return _team_logo_cache[key]
+    raw = _load_team_logo_raw(team_code)
+    if raw is None:
+        _team_logo_cache[key] = None
+        return None
+    h, w = raw.shape[:2]
+    new_w = max(1, int(round(w * bucket_h / h)))
+    sized = cv2.resize(raw, (new_w, bucket_h), interpolation=cv2.INTER_AREA)
+    # Module l'alpha par TEAM_LOGO_ALPHA puis pré-multiplie RGB par alpha
+    # (composite_bgra attend de la pré-mul).
+    a = sized[:, :, 3].astype(np.float32) * (TEAM_LOGO_ALPHA / 255.0)  # 0..TEAM_LOGO_ALPHA
+    sized[:, :, 3] = (a * 255.0).clip(0, 255).astype(np.uint8)
+    a3 = a[..., None]
+    sized[:, :, :3] = (sized[:, :, :3].astype(np.float32) * a3).clip(0, 255).astype(np.uint8)
+    _team_logo_cache[key] = sized
+    return sized
+
+
+_scene_logo_cache: dict = {}
+
+
+def _load_scene_logo_sized(path: str, target_h: int, alpha: float) -> "np.ndarray | None":
+    """Charge + dimensionne + pré-multiplie alpha le logo scene. Cache par
+    (path, mtime, target_h, alpha) pour éviter de re-charger 60×/s."""
+    try:
+        mtime = os.path.getmtime(path)
+    except OSError:
+        return None
+    key = (path, mtime, target_h, alpha)
+    if key in _scene_logo_cache:
+        return _scene_logo_cache[key]
+    img = cv2.imread(path, cv2.IMREAD_UNCHANGED)
+    if img is None:
+        _scene_logo_cache[key] = None
+        return None
+    if img.ndim == 2:
+        img = cv2.cvtColor(img, cv2.COLOR_GRAY2BGRA)
+    elif img.shape[2] == 3:
+        a = np.full(img.shape[:2], 255, dtype=np.uint8)
+        img = np.dstack([img, a])
+    h, w = img.shape[:2]
+    new_w = max(1, int(round(w * target_h / h)))
+    # INTER_AREA optimal pour downscale, LANCZOS4 pour upscale (préserve
+    # les bords nets quand on agrandit un petit logo). Branchement
+    # automatique selon target.
+    interp = cv2.INTER_AREA if target_h <= h else cv2.INTER_LANCZOS4
+    sized = cv2.resize(img, (new_w, target_h), interpolation=interp)
+    # Apply global alpha + pre-mul RGB
+    a = sized[:, :, 3].astype(np.float32) * (alpha / 255.0)
+    sized[:, :, 3] = (a * 255.0).clip(0, 255).astype(np.uint8)
+    a3 = a[..., None]
+    sized[:, :, :3] = (sized[:, :, :3].astype(np.float32) * a3).clip(0, 255).astype(np.uint8)
+    _scene_logo_cache[key] = sized
+    return sized
+
+
+def _compute_chroma_mask(frame_bgr: np.ndarray) -> np.ndarray:
+    """Calcule un mask uint8 (H, W) compatible composite_bgra(mask=...) :
+    0 où le pixel est proche de la couleur clé (= fond, logo OK), 255
+    sinon (= foreground, logo caché). Ramp linéaire sur la zone de
+    transition pour des bords lisses, pas de stairstep.
+    """
+    try:
+        b, g, r = (int(v) for v in SCENE_LOGO_KEY_BGR.split(","))
+    except (ValueError, AttributeError):
+        b, g, r = 60, 60, 60
+    target = np.array([b, g, r], dtype=np.float32)
+    diff = frame_bgr.astype(np.float32) - target
+    dist = np.sqrt((diff * diff).sum(axis=2))
+    inner = SCENE_LOGO_KEY_TOLERANCE
+    outer = inner + max(1.0, SCENE_LOGO_KEY_SOFTNESS)
+    mask = ((dist - inner) / (outer - inner) * 255.0).clip(0, 255).astype(np.uint8)
+    return mask
+
+
+def draw_scene_logo_behind(frame: np.ndarray,
+                            mask: "np.ndarray | None") -> None:
+    """Composite un logo générique à position fixe (X/Y_FRACTION du
+    frame).
+
+    Sélection du mask de découpe :
+      - SCENE_LOGO_CHROMA_KEY=1 → mask calculé par proximité de couleur
+        au fond (key BGR). Robuste pour les plateaux/scènes où RVM ne
+        détecte pas tout (présentateurs en costume, etc.) car il suffit
+        que le fond ait une couleur uniforme.
+      - sinon → utilise le mask RVM passé en paramètre.
+    """
+    if not SCENE_LOGO_BEHIND:
+        return
+    logo = _load_scene_logo_sized(SCENE_LOGO_PATH, SCENE_LOGO_HEIGHT, SCENE_LOGO_ALPHA)
+    if logo is None:
+        return
+    # Si chroma key actif ET mask RVM dispo : UNION des deux (= cache
+    # le logo dès que l'un OU l'autre détecte du foreground). Ça
+    # rattrape les vêtements proches du gris (RVM les voit) et les
+    # objets non-humains (chroma les voit).
+    if SCENE_LOGO_CHROMA_KEY:
+        chroma = _compute_chroma_mask(frame)
+        if mask is not None and mask.shape == chroma.shape:
+            effective_mask = np.maximum(chroma, mask)
+        else:
+            effective_mask = chroma
+    else:
+        effective_mask = mask
+    H, W = frame.shape[:2]
+    lh, lw = logo.shape[:2]
+    cx = int(W * SCENE_LOGO_X_FRACTION)
+    cy = int(H * SCENE_LOGO_Y_FRACTION)
+    composite_bgra(frame, logo, cx - lw // 2, cy - lh // 2, mask=effective_mask)
+
+
+def draw_team_logos_behind(frame: np.ndarray, tracks,
+                            mask: "np.ndarray | None") -> None:
+    """Composite UN logo par ÉQUIPE (pas par rider), à position FIXE
+    sur l'écran (= ancré au fond, pas au rider). Si plusieurs équipes
+    identifiées, les logos sont alignés en row centré horizontalement,
+    avec TEAM_LOGO_SPACING_PX entre eux. composite_bgra(mask=...) cache
+    le logo là où le mask dit "rider" → l'effet "logo sur fond gris,
+    coureur devant" est obtenu sans suivre les bboxes.
+    """
+    if not TEAM_LOGO_BEHIND:
+        return
+    # Liste ordonnée des team_codes uniques détectés (skip les
+    # non-identifiés et ceux sans label rendu). Ordre déterministe =
+    # tri alphabétique pour stabilité visuelle d'un frame à l'autre.
+    seen: set[str] = set()
+    team_codes: list[str] = []
+    for t in tracks:
+        team_code = getattr(t, "team_code", None)
+        if not team_code or t.label_img is None:
+            continue
+        if team_code in seen:
+            continue
+        seen.add(team_code)
+        team_codes.append(team_code)
+    if not team_codes:
+        return
+    team_codes.sort()
+
+    # Récupère les logos dimensionnés (skip ceux sans fichier dispo).
+    logos = []
+    for code in team_codes:
+        lg = get_team_logo_sized(code, TEAM_LOGO_HEIGHT)
+        if lg is not None:
+            logos.append(lg)
+    if not logos:
+        return
+
+    H, W = frame.shape[:2]
+    total_w = sum(l.shape[1] for l in logos) + TEAM_LOGO_SPACING_PX * (len(logos) - 1)
+    cur_x = (W - total_w) // 2
+    cy = int(H * TEAM_LOGO_Y_FRACTION)
+    for lg in logos:
+        lh, lw = lg.shape[:2]
+        composite_bgra(frame, lg, cur_x, cy - lh // 2, mask=mask)
+        cur_x += lw + TEAM_LOGO_SPACING_PX
 
 
 # ──────────────────────── Tracker Kalman + IoU matching ──────────────────
@@ -2052,7 +3117,17 @@ class FaceTrack:
         self.bib_name: str | None = None
         # Code nationalité 3-letter ISO (ex "DEN", "FRA") issu du JSON
         # partants. None si rider hors liste.
+        # NOTE historique : ce champ a contenu pendant un temps le team_code
+        # (étiquette de droite du label). Depuis l'ajout du drapeau on a
+        # un champ dédié `team_code` ci-dessous, et `nationality` retrouve
+        # son sens d'origine (code pays IOC, sert au lookup drapeau).
         self.nationality: str | None = None
+        self.team_code: str | None = None
+        self.team_name: str | None = None
+        # Résolu à la première (re-)vote en fallback manifest puis
+        # partants. Sert au lookup photo portrait (render_lower_third)
+        # et à la vignette skeleton view.
+        self.uciid: str | None = None
         # True quand le bib a été confirmé par cross-check OCR ↔ face/partants
         # (associate_bibs_to_tracks cas 2). Visuel : puce avant le numéro
         # dans le label rendu.
@@ -2095,6 +3170,12 @@ class FaceTrack:
         # (sinon tous en sync = visuellement faux).
         import random
         self.orbit_phase_s: float = random.uniform(0, _ORBIT_PERIOD_S)
+        # Cache du warp pseudo-3D par bucket d'angle yaw. Invalidé par
+        # identité quand label_img est remplacé (re-render après re-vote
+        # ou bib OCR confirm). Le yaw oscille lentement (~0.35°/frame),
+        # cache plein après une orbite (~6s) puis 100% hit ensuite.
+        self._orbit_cache_for: np.ndarray | None = None
+        self._orbit_cache: dict[int, np.ndarray] = {}
         # Niveau d'empilement vertical (0 = au-dessus du visage à la
         # distance naturelle, +1 = 1 cran plus haut, etc.). Latché avec
         # hystérésis : on monte vite quand une collision apparaît, on
@@ -2103,6 +3184,12 @@ class FaceTrack:
         # seul Y bouge — chaque label reste lisiblement "sur son visage".
         self.stack_level: int = 0
         self.detach_countdown: int = 0
+        # Compteur consécutif "perdant en dédup IoU" : incrémenté chaque
+        # frame où ce track est éjecté du rendu par overlap fort avec un
+        # track au meilleur score. Latché à _LABEL_IOU_SUPPRESS_FRAMES
+        # avant suppression réelle, pour éviter le flicker quand 2 tracks
+        # voisins en peloton dense échangent fréquemment la palme du score.
+        self.iou_losing_streak: int = 0
         # Dernière cible utilisée (avant EMA). Sert au dead-zone : tant que
         # la nouvelle cible reste à <_LABEL_TARGET_DEADZONE_PX de la
         # précédente, on garde la précédente pour ne pas réveiller l'EMA
@@ -2295,7 +3382,7 @@ _LABEL_STACK_MAX = 6
 # nombre de frames consécutives "niveau plus bas serait OK" avant de
 # redescendre. À 10 fps = 3s. Évite les ascenseurs frame-à-frame quand
 # les visages oscillent autour du seuil de collision.
-_LABEL_DETACH_FRAMES = 30
+_LABEL_DETACH_FRAMES = int(env("LABEL_DETACH_FRAMES", "30"))
 # Marge (px) ajoutée au rect du label lors du test de collision côté
 # descente : on n'accepte de descendre que si le niveau plus bas serait
 # clair avec cette marge — sinon ça re-monterait à la première oscillation.
@@ -2314,6 +3401,18 @@ _LABEL_TARGET_DEADZONE_PX = int(env("LABEL_TARGET_DEADZONE_PX", "24"))
 # stabilité requise. Évite les flips nerveux quand le visage longe le
 # bord haut du frame.
 _LABEL_FLIP_HYST_FRAMES = int(env("LABEL_FLIP_HYST_FRAMES", "60"))
+# Seuil IoU pour considérer 2 tracks comme le même visage physique
+# (= dédup spatial). 0.7 = overlap franc requis ; sous ce seuil les
+# 2 labels coexistent (le stack vertical s'occupe du visuel).
+# Historique : 0.5 flicker en peloton dense, 2 scores ArcFace voisins
+# swappaient l'élection à chaque re-vote asynchrone.
+_LABEL_IOU_DEDUP = float(env("LABEL_IOU_DEDUP", "0.7"))
+# Latch : un track sort vraiment du rendu après ce nombre de frames
+# consécutives perdantes en dédup IoU. En-deçà, il reste affiché —
+# au prix d'un stack temporaire que les autres mécanismes amortissent.
+# À 60 fps = 0.33s : assez pour qu'une vraie duplication d'identité
+# soit confirmée, tout en absorbant les swaps ponctuels de score.
+_LABEL_IOU_SUPPRESS_FRAMES = int(env("LABEL_IOU_SUPPRESS_FRAMES", "20"))
 
 # ── Pseudo-3D billboard (titrage 3D qui orbite, effet broadcast pro) ──
 # Toggle env var : 0 = label 2D classique.
@@ -2323,6 +3422,12 @@ PSEUDO_3D = bool(int(env("PSEUDO_3D", "1")))
 _ORBIT_PERIOD_S = float(env("ORBIT_PERIOD_S", "6.0"))
 # Amplitude max du yaw (degrés). 15-25 = effet visible, > 40 = caricature.
 _ORBIT_YAW_AMP_DEG = float(env("ORBIT_YAW_AMP_DEG", "20.0"))
+# Pas de quantification du yaw pour le cache de warp. À 1° on a ~41
+# warps uniques par track sur tout l'orbit ; visuellement le pas est
+# indiscernable (< 0.5 px de différence sur la largeur du label). Cache
+# évite de relancer cv2.warpPerspective chaque frame × chaque track,
+# coût dominant quand le peloton dépasse 10 visages.
+_ORBIT_YAW_BUCKET_DEG = float(env("ORBIT_YAW_BUCKET_DEG", "1.0"))
 
 
 def _rect_collide(a, b) -> bool:
@@ -2330,8 +3435,94 @@ def _rect_collide(a, b) -> bool:
     return not (a[2] <= b[0] or b[2] <= a[0] or a[3] <= b[1] or b[3] <= a[1])
 
 
+def _orbital_warp_cached(t, yaw_deg: float) -> np.ndarray:
+    """Wrapper de _orbital_warp avec cache par track + bucket d'angle.
+
+    Le yaw oscille continûment (sin) sur ORBIT_PERIOD_S ; à 60 fps c'est
+    ~0.35°/frame en peak rate. Avec un bucket de 1°, ~3 frames consécutives
+    partagent le même warp → ~70% hit ratio dès la 1ère orbite, 100%
+    ensuite. Coût warpPerspective ÷ ~3-30 selon la densité de peloton.
+    Invalidé par identité de t.label_img : tout re-render du label
+    (re-vote, bib confirm, index reload) reset le cache.
+    """
+    if t._orbit_cache_for is not t.label_img:
+        t._orbit_cache_for = t.label_img
+        t._orbit_cache.clear()
+    bucket = int(round(yaw_deg / _ORBIT_YAW_BUCKET_DEG))
+    cached = t._orbit_cache.get(bucket)
+    if cached is None:
+        cached = _orbital_warp(t.label_img,
+                               bucket * _ORBIT_YAW_BUCKET_DEG)
+        t._orbit_cache[bucket] = cached
+    return cached
+
+
+# State persistant du dédup par nom latché : name → (track_id keeper,
+# score latché). Vidé pour les noms qui sortent de l'écran (évite
+# croissance infinie). Marge nécessaire au challenger pour prendre la
+# place du keeper actuel.
+_NAME_KEEPER: dict[str, tuple[int, float]] = {}
+_NAME_KEEPER_MARGIN = float(env("NAME_KEEPER_MARGIN", "0.05"))
+
+
+def _dedup_by_name_latched(placeable):
+    """Garde 1 seul track par nom (le keeper latché). Le keeper ne change
+    que si un challenger même-nom dépasse son score de +MARGIN, sinon
+    on conserve le keeper même quand un concurrent grimpe transitoirement.
+    Si le keeper sort de placeable (track mort/perdu), on élit le meilleur
+    score parmi les candidats restants."""
+    by_name: dict[str, list] = {}
+    for tr in placeable:
+        by_name.setdefault(tr.name, []).append(tr)
+
+    kept = []
+    seen_names = set()
+    for name, candidates in by_name.items():
+        seen_names.add(name)
+        if len(candidates) == 1:
+            keeper = candidates[0]
+            _NAME_KEEPER[name] = (keeper.id, keeper.score)
+            kept.append(keeper)
+            continue
+        # Cherche le keeper actuel parmi les candidats présents.
+        current = _NAME_KEEPER.get(name)
+        keeper = None
+        if current is not None:
+            keeper_id, _ = current
+            for tr in candidates:
+                if tr.id == keeper_id:
+                    keeper = tr
+                    break
+        if keeper is None:
+            # Pas de keeper (mort ou jamais élu) → élit le meilleur score.
+            keeper = max(candidates, key=lambda t: t.score)
+        else:
+            # Keeper toujours là : vérifie si un challenger domine de
+            # +MARGIN. Sinon on garde.
+            challenger = max(
+                (t for t in candidates if t.id != keeper.id),
+                key=lambda t: t.score, default=None,
+            )
+            if (challenger is not None
+                    and challenger.score >= keeper.score
+                                              + _NAME_KEEPER_MARGIN):
+                keeper = challenger
+        _NAME_KEEPER[name] = (keeper.id, keeper.score)
+        kept.append(keeper)
+
+    # GC du state pour les noms qui ne sont plus à l'écran (sinon le dict
+    # croît à vie). On garde simple : tout nom absent de cette frame est
+    # purgé, même s'il revient plus tard (perte du latch). Compromis OK
+    # vu que le re-vote suivant ré-initialisera proprement.
+    for stale in list(_NAME_KEEPER.keys()):
+        if stale not in seen_names:
+            del _NAME_KEEPER[stale]
+    return kept
+
+
 def draw_tracks(frame: np.ndarray, tracks,
-                bodies: list[dict] | None = None) -> None:
+                bodies: list[dict] | None = None,
+                mask: "np.ndarray | None" = None) -> None:
     """Composite le lower-third (nom + flèche) pour chaque track actif.
 
     Politique de placement :
@@ -2365,29 +3556,35 @@ def draw_tracks(frame: np.ndarray, tracks,
 
     placeable = [t for t in tracks if t.label_img is not None]
 
-    # Dédoublonnage par nom : un même sportif ne doit jamais apparaître
-    # deux fois à l'écran. Cause typique : un track fantôme survit après
-    # une ré-id sur un autre track, ou 2 faces du dataset matchent le même
-    # nom (sosies, embedding bruyant). On garde celui dont la bbox est la
-    # plus proche du centre de l'image — c'est lui qui est censé être le
-    # "vrai" sujet.
-    if placeable:
-        fh_frame, fw_frame = frame.shape[:2]
-        cx_frame = fw_frame * 0.5
-        cy_frame = fh_frame * 0.5
+    # ── Dédup par nom LATCHÉ : un seul track affiché par nom à la fois.
+    # Le keeper change UNIQUEMENT si un challenger dépasse son score de
+    # +NAME_KEEPER_MARGIN — sinon on garde le keeper actuel, même si un
+    # autre a temporairement un score plus haut. Tue le flicker quand
+    # plusieurs faces (sosies / mismatches embedding) votent le même
+    # nom : on choisit une fois pour toutes, on s'y tient.
+    placeable = _dedup_by_name_latched(placeable)
 
-        def _dist_sq_to_center(tr) -> float:
-            bx1, by1, bx2, by2 = tr.bbox_xyxy()
-            bcx = (bx1 + bx2) * 0.5
-            bcy = (by1 + by2) * 0.5
-            return (bcx - cx_frame) ** 2 + (bcy - cy_frame) ** 2
+    # ── Mode RAW : court-circuit total du placement pour isoler la
+    # source du stutter. Placement direct au centre du visage, aucun
+    # EMA, deadzone, stack, flip, dédup IoU, ni warp. Toggle via env
+    # LABEL_RAW_PLACEMENT=1 (2026-05-29 debug session).
+    if int(env("LABEL_RAW_PLACEMENT", "1")):
+        for t in placeable:
+            x1, y1, x2, y2 = (int(v) for v in t.bbox_xyxy())
+            lh, lw = t.label_img.shape[:2]
+            dx = (x1 + x2) // 2 - lw // 2
+            dy = y1 - lh - 18  # au-dessus du visage, gap fixe
+            if dy < 0:
+                dy = y2 + 18  # flip dessous si hors cadre
+            composite_bgra(frame, t.label_img, dx, dy, mask=mask)
+        return
 
-        best_by_name: dict[str, "Track"] = {}
-        for tr in placeable:
-            prev = best_by_name.get(tr.name)
-            if prev is None or _dist_sq_to_center(tr) < _dist_sq_to_center(prev):
-                best_by_name[tr.name] = tr
-        placeable = list(best_by_name.values())
+    # Dédup par nom + centrage SUPPRIMÉ (2026-05-29) : la distance-au-
+    # centre se recalculait chaque frame, ce qui faisait osciller le
+    # keeper entre 2 tracks de même nom → flicker synchrones perçus
+    # comme "tous les labels d'un coup". On accepte le risque de voir un
+    # nom afficher 2 fois (sosies, ghost, ré-id partielle) ; le dédup
+    # spatial IoU≥0.7 latché ci-dessous suffit dans la plupart des cas.
 
     # Dédoublonnage spatial : un visage = un seul label, point. Si deux
     # tracks ont des bbox qui s'overlap fortement (IoU ≥ 0.5), ils
@@ -2400,11 +3597,23 @@ def draw_tracks(frame: np.ndarray, tracks,
         by_score = sorted(placeable,
                           key=lambda tr: tr.score, reverse=True)
         kept: list = []
+        suppressed: list = []
         for tr in by_score:
             tr_bbox = tr.bbox_xyxy()
-            if any(_iou(tr_bbox, k.bbox_xyxy()) >= 0.5 for k in kept):
-                continue
-            kept.append(tr)
+            if any(_iou(tr_bbox, k.bbox_xyxy()) >= _LABEL_IOU_DEDUP
+                   for k in kept):
+                suppressed.append(tr)
+            else:
+                kept.append(tr)
+                tr.iou_losing_streak = 0
+        # Latch : un track suppressé reste rendu tant qu'il n'a pas perdu
+        # _LABEL_IOU_SUPPRESS_FRAMES frames consécutives. Au-delà on l'éjecte.
+        # Le stack_level vertical absorbe l'overlap temporaire pendant la
+        # période de grâce, mieux qu'un on/off frame-à-frame.
+        for tr in suppressed:
+            tr.iou_losing_streak += 1
+            if tr.iou_losing_streak < _LABEL_IOU_SUPPRESS_FRAMES:
+                kept.append(tr)
         placeable = kept
 
     # Tri par track_id (= ordre d'apparition, STABLE d'une frame à l'autre).
@@ -2422,9 +3631,12 @@ def draw_tracks(frame: np.ndarray, tracks,
         x1, y1, x2, y2 = (int(v) for v in t.bbox_xyxy())
 
         # Pseudo-3D : oscille en yaw selon la phase d'orbite du track.
+        # Warp caché par bucket d'angle (cf _orbital_warp_cached) : sans
+        # cache, 10+ tracks × 60 fps × cv2.warpPerspective sature le CPU
+        # et contribue aux stutters de label perçus en peloton dense.
         if PSEUDO_3D:
             yaw_deg = _orbital_yaw_deg(now_s, t.orbit_phase_s)
-            label_to_draw = _orbital_warp(t.label_img, yaw_deg)
+            label_to_draw = _orbital_warp_cached(t, yaw_deg)
         else:
             label_to_draw = t.label_img
         lh, lw = label_to_draw.shape[:2]
@@ -2476,35 +3688,65 @@ def draw_tracks(frame: np.ndarray, tracks,
             # Saturé : on accepte la collision au max level (rare).
             needed_level = _LABEL_STACK_MAX
 
-        # 2. Hystérésis sur le stack_level latché :
-        #    - si needed > stack_level → on monte tout de suite.
-        #    - si needed == stack_level → niveau OK, reset countdown.
-        #    - si needed < stack_level → on teste avec MARGE qu'un niveau
-        #      intermédiaire (current_level - 1) serait clair ; si oui,
-        #      on incrémente le countdown ; à _LABEL_DETACH_FRAMES on
-        #      descend d'un cran. Ainsi la descente est progressive et
-        #      vraiment justifiée.
-        if needed_level > t.stack_level:
+        # 2. Premier arrivé premier servi : le stack_level est figé à la
+        #    première placement du track. Les nouveaux tracks qui
+        #    arrivent ensuite calculent leur needed_level contre les
+        #    tracks déjà placés (boucle déterministe sortée par id) et
+        #    se positionnent au-dessus si besoin. Les tracks existants
+        #    NE bougent plus, même si le voisinage change.
+        if not getattr(t, "_stack_locked", False):
             t.stack_level = needed_level
             t.detach_countdown = 0
-        elif needed_level == t.stack_level:
-            t.detach_countdown = 0
-        else:
-            # needed < stack_level : tester avec marge le niveau juste
-            # en-dessous du courant. Si ça collide encore avec marge, on
-            # reset le countdown (la descente n'est pas vraiment sûre).
-            if _collides_at(t.stack_level - 1,
-                            margin=_LABEL_ANCHOR_MARGIN_PX):
-                t.detach_countdown = 0
-            else:
-                t.detach_countdown += 1
-                if t.detach_countdown >= _LABEL_DETACH_FRAMES:
-                    t.stack_level -= 1
-                    t.detach_countdown = 0
+            t._stack_locked = True  # type: ignore[attr-defined]
+        # else: t.stack_level reste tel quel, on respecte la place
+        # historique du track.
 
         # 3. Position cible finale + dead-zone.
         target_x = nat_x
         target_y = _ty_at(t.stack_level)
+
+        # Anti-hors-cadre : si la position cible part au-dessus (ou en
+        # dessous) du frame, force-flip vers l'autre côté ET reset latches
+        # (court-circuite l'hystérésis qui sinon laisse le label invisible
+        # pendant _LABEL_FLIP_HYST_FRAMES). On ne fait ça que si le côté
+        # opposé tient effectivement dans le cadre — sinon clamp final.
+        H_frame = frame.shape[0]
+        if (target_y < 0) or (target_y + lh > H_frame):
+            # Tente l'autre côté.
+            alt_flipped = not flipped
+            alt_nat_y = (y2 + face_gap) if alt_flipped else (y1 - lh - face_gap)
+            alt_step_sign = +1 if alt_flipped else -1
+            def _alt_ty_at(level: int) -> int:
+                return alt_nat_y + alt_step_sign * level * step
+            def _alt_collides_at(level: int) -> bool:
+                ty = _alt_ty_at(level)
+                r = (nat_x, ty, nat_x + lw, ty + lh)
+                return any(_rect_collide(r, pr) for pr in placed_by_id.values())
+            alt_level = 0
+            while alt_level <= _LABEL_STACK_MAX and _alt_collides_at(alt_level):
+                alt_level += 1
+            if alt_level > _LABEL_STACK_MAX:
+                alt_level = _LABEL_STACK_MAX
+            alt_target_y = _alt_ty_at(alt_level)
+            # Bascule SI l'autre côté donne une position effectivement
+            # in-frame (sinon les deux côtés sont saturés, garde le moins
+            # mauvais via le clamp ci-dessous).
+            if 0 <= alt_target_y and alt_target_y + lh <= H_frame:
+                flipped = alt_flipped
+                step_sign = alt_step_sign
+                t.label_flipped = flipped
+                t.flip_change_countdown = 0
+                t.stack_level = alt_level
+                t.detach_countdown = 0
+                target_y = alt_target_y
+
+        # Clamp final de sécurité : si même l'autre côté ne tient pas,
+        # on évite quand même l'invisible total.
+        if target_y < 0:
+            target_y = 0
+        elif target_y + lh > H_frame:
+            target_y = H_frame - lh
+
         if (t.last_target_x is not None
                 and abs(target_x - t.last_target_x)
                     < _LABEL_TARGET_DEADZONE_PX
@@ -2531,10 +3773,65 @@ def draw_tracks(frame: np.ndarray, tracks,
 
         dx, dy = int(t.display_x), int(t.display_y)
         placed_by_id[t.id] = (dx, dy, dx + lw, dy + lh)
-        composite_bgra(frame, label_to_draw, dx, dy)
+        composite_bgra(frame, label_to_draw, dx, dy, mask=mask)
 
 
 _stats_last_det_count = 0  # snapshot précédent du cumul détections worker
+
+# Encoder NVJPEG global, init lazy à la 1ère frame (taille fixe après).
+# Fallback automatique sur cv2.imencode si l'init échoue ou si encode
+# raise une exception (logué une seule fois pour éviter le spam).
+_nvjpeg_encoder = None
+_nvjpeg_init_attempted = False
+_nvjpeg_error_logged = False
+
+
+def _gpu_encode_or_cv2(frame: np.ndarray) -> bytes | None:
+    """Encode JPEG la frame BGR. Essaye NVJPEG GPU si NVJPEG_ENABLED,
+    fallback cv2.imencode CPU sur toute erreur. Retourne bytes ou None."""
+    global _nvjpeg_encoder, _nvjpeg_init_attempted, _nvjpeg_error_logged
+    h, w = frame.shape[:2]
+    if NVJPEG_ENABLED:
+        # Init lazy à la 1ère frame.
+        if not _nvjpeg_init_attempted:
+            _nvjpeg_init_attempted = True
+            try:
+                from nvjpeg_encoder import NvJpegEncoder
+                _nvjpeg_encoder = NvJpegEncoder(w, h, quality=JPEG_QUALITY,
+                                                  sampling="420")
+                log(f"NVJPEG encoder init OK ({w}x{h} Q={JPEG_QUALITY})")
+            except Exception as e:
+                log(f"NVJPEG init échec ({e}) → fallback cv2.imencode")
+                _nvjpeg_encoder = None
+        # Re-init si la taille de frame a changé (rare, ex: bullet-time
+        # warp produit une taille différente).
+        if (_nvjpeg_encoder is not None
+                and (w != _nvjpeg_encoder.width
+                     or h != _nvjpeg_encoder.height)):
+            try:
+                _nvjpeg_encoder.close()
+                from nvjpeg_encoder import NvJpegEncoder
+                _nvjpeg_encoder = NvJpegEncoder(w, h, quality=JPEG_QUALITY,
+                                                  sampling="420")
+            except Exception as e:
+                if not _nvjpeg_error_logged:
+                    log(f"NVJPEG re-init échec ({e}) → fallback cv2")
+                    _nvjpeg_error_logged = True
+                _nvjpeg_encoder = None
+        if _nvjpeg_encoder is not None:
+            try:
+                return _nvjpeg_encoder.encode(frame)
+            except Exception as e:
+                if not _nvjpeg_error_logged:
+                    log(f"NVJPEG encode err ({e}) → fallback cv2 (one-shot)")
+                    _nvjpeg_error_logged = True
+                # Continue vers le fallback cv2 ci-dessous.
+    ok, buf = cv2.imencode(".jpg", frame,
+                            [cv2.IMWRITE_JPEG_QUALITY, JPEG_QUALITY])
+    if not ok:
+        return None
+    return bytes(buf)
+
 
 def processing_loop(cap, app: FaceAnalysis,
                     index: FaceIndex, fbuf: FrameBuffer,
@@ -2579,6 +3876,8 @@ def processing_loop(cap, app: FaceAnalysis,
     # sleep entre les publish au lieu de cap.read()-bloquer. Publie aussi
     # en SHM pour les consumers co-localisés.
     cap_worker = CaptureWorker(cap, shm_pub=shm_pub)
+    # Expose au HTTP handler pour les endpoints /pause /resume /toggle.
+    MJPEGHandler.cap_worker = cap_worker
 
     # Tracker custom : 1 Kalman par face (filterpy) + matching IoU + ré-id
     # par embedding ArcFace. Quand un visage est baissé (RetinaFace perd la
@@ -2588,7 +3887,11 @@ def processing_loop(cap, app: FaceAnalysis,
     # display_buffer auto = nb publish frames entre 2 détections + 1 buffer.
     # À 30/6 → 6 ; à 60/6 → 11 ; à 30/30 → 2. Évite que la bbox clignote
     # entre 2 détections.
-    _display_buf = max(2, int(round(TARGET_FPS / max(1, DETECT_FPS))) + 1)
+    # Override via env DISPLAY_BUFFER : utile quand DETECT >= TARGET mais
+    # la variance de latence GPU produit des is_new=False par bursts → tracks
+    # masqués cycliquement. Floor = 6 frames (~200ms@30fps) pour absorber.
+    _auto = max(6, int(round(TARGET_FPS / max(1, DETECT_FPS))) + 1)
+    _display_buf = int(env("DISPLAY_BUFFER", str(_auto)))
     track_mgr = TrackManager(
         iou_threshold=0.3,
         max_missed=TRACK_BUFFER,
@@ -2609,6 +3912,15 @@ def processing_loop(cap, app: FaceAnalysis,
     # baissé, profil), via la position du keypoint nez/yeux du squelette.
     bodies_state = BodiesState(BODIES_JSON)
 
+    # Mask reader pour le compositing avec mask alpha (publié par
+    # avtowan-mask-recog.service). Utilisé par MASK_BEHIND_LABELS et/ou
+    # TEAM_LOGO_BEHIND. Lazy attach : si mask service down, latest()
+    # renvoie None → fallback no-mask (labels au-dessus, logos sans
+    # découpe). On l'instancie seulement si au moins une des features
+    # qui en dépend est active.
+    mask_reader = SHMMaskReader(MASK_SHM_NAME, MASK_STALE_MAX_AGE_S) \
+        if (MASK_BEHIND_LABELS or TEAM_LOGO_BEHIND or SCENE_LOGO_BEHIND) else None
+
     while not stop.is_set():
         now = time.monotonic()
 
@@ -2628,14 +3940,22 @@ def processing_loop(cap, app: FaceAnalysis,
                     t.label_img     = None
             last_index_check = now
 
+        _t0 = time.monotonic()
+        _timings = {}
+
         # Pull la dernière frame du capture worker (drop-oldest).
         frame = cap_worker.get_latest()
         if frame is None:
             continue  # pas encore de frame, on retentera au tick suivant
+        _timings["cap_get"] = (time.monotonic() - _t0) * 1000
 
+        _t_a = time.monotonic()
         # Submit la frame courante au worker (copie nécessaire pour qu'il
         # ait sa propre vue stable pendant qu'on enchaîne sur la suivante).
         det_worker.submit(frame.copy())
+        _timings["det_submit"] = (time.monotonic() - _t_a) * 1000
+        _t_post_submit = time.monotonic()
+        _t_section_revote = _t_post_submit  # marker pour la section re-vote
 
         # Récupère la dernière détection disponible. is_new=True seulement
         # si le worker a publié de nouveaux résultats depuis le dernier
@@ -2664,11 +3984,11 @@ def processing_loop(cap, app: FaceAnalysis,
         active_tracks = track_mgr.active()
         associate_bodies_to_tracks(active_tracks, bodies_now)
 
+        _MAX_VOTES_PER_FRAME = int(env("MAX_VOTES_PER_FRAME", "2"))
+        votes_this_frame = 0
         for t in active_tracks:
-            # Décide s'il faut (re-)voter :
-            #   - jamais résolu ET assez de samples → vote initial
-            #   - déjà résolu ET assez de nouveaux samples accumulés
-            #     depuis le dernier vote → re-vote (correction possible).
+            if votes_this_frame >= _MAX_VOTES_PER_FRAME:
+                break
             need_vote = False
             if (not t.name_resolved
                     and len(t.embedding_samples) >= _EMB_SAMPLES_MIN):
@@ -2678,9 +3998,7 @@ def processing_loop(cap, app: FaceAnalysis,
                 need_vote = True
             if not need_vote:
                 continue
-
-            # Multi-frame voting : moyenne des embeddings, re-normalise
-            # (les embeddings ArcFace vivent sur l'hypersphère unité).
+            votes_this_frame += 1
             avg = np.mean(t.embedding_samples, axis=0)
             norm = float(np.linalg.norm(avg))
             if norm > 1e-6:
@@ -2700,8 +4018,20 @@ def processing_loop(cap, app: FaceAnalysis,
                 continue
 
             name_changed = (new_name != t.name)
+            # Stickiness : si déjà résolu et que le concurrent ne domine pas
+            # franchement, on garde l'ancien nom (et on lisse le score). Évite
+            # les flips d'identité sur les riders pile au seuil.
+            if (name_changed and t.name_resolved
+                    and new_score < t.score + _NAME_SWITCH_MARGIN):
+                new_name = t.name
+                name_changed = False
             t.name = new_name
-            t.score = new_score
+            # EMA sur le score si pas de changement d'identité (sinon snap).
+            if t.name_resolved and not name_changed:
+                t.score = (1.0 - _SCORE_SMOOTH_ALPHA) * t.score \
+                          + _SCORE_SMOOTH_ALPHA * new_score
+            else:
+                t.score = new_score
             t.name_resolved = True
 
             # Si le nom a changé (corruption corrigée ou nouvelle id),
@@ -2719,10 +4049,14 @@ def processing_loop(cap, app: FaceAnalysis,
                     elif t.bib is None:
                         t.bib = meta.get("bib")
                     t.nationality = meta.get("nationality")
+                    t.team_code = meta.get("team_code")
+                    t.team_name = meta.get("team_name")
                 elif name_changed:
                     # Nouveau nom hors partants : on jette les meta.
                     t.bib = None
                     t.nationality = None
+                    t.team_code = None
+                    t.team_name = None
                     t.bib_confirmed = False
 
             # Charge la vignette photo 1× depuis face-db/<uciid>/ pour le
@@ -2733,12 +4067,20 @@ def processing_loop(cap, app: FaceAnalysis,
             # tous les sportifs du dataset), fallback partants TDF.
             if name_changed:
                 t.photo_thumb = None
-            if t.photo_thumb is None:
+                t.uciid = None
+            if t.uciid is None:
                 uciid = _NAME_TO_UCIID.get(t.name, "")
                 if not uciid:
                     meta = _RIDERS_META.get(t.name)
                     uciid = meta.get("uciid") if meta else ""
-                photo = load_rider_photo(uciid, SKELETON_PHOTO_SIZE)
+                t.uciid = uciid or None
+            # Photo thumb pour skeleton view : charge UNIQUEMENT si le
+            # skeleton stream a au moins un subscriber. Sinon on perd
+            # 5-20 ms par track sur un load disque dont personne ne se
+            # sert. draw_skeleton_view est gated par subscribers > 0
+            # plus loin, donc cohérent.
+            if t.photo_thumb is None and skel_buf.subscribers > 0:
+                photo = load_rider_photo(t.uciid or "", SKELETON_PHOTO_SIZE)
                 t.photo_thumb = photo if photo is not None else False
 
             # (Re-)render label avec hystérésis sur la visibilité :
@@ -2756,18 +4098,45 @@ def processing_loop(cap, app: FaceAnalysis,
                 currently_shown and t.score >= keep_thresh
             )
             if should_show:
-                t.label_img = render_lower_third(
-                    t.name, t.score,
-                    bib=t.bib, nationality=t.nationality,
-                    bib_confirmed=t.bib_confirmed,
-                )
+                sig = (t.name, t.bib, t.team_code, t.team_name,
+                       t.nationality, t.bib_confirmed, t.uciid)
+                was_none = t.label_img is None
+                if was_none or sig != getattr(t, "_label_sig", None):
+                    # 1) Lookup cache pré-rendu si bib_confirmed=False
+                    # (cas standard, OCR off). Sinon render à la volée
+                    # (rare). Évite ~15 ms PIL render dans la critical path.
+                    cached = (_LABEL_PRERENDER_CACHE.get(t.name)
+                              if not t.bib_confirmed else None)
+                    if cached is not None:
+                        t.label_img = cached
+                    else:
+                        t.label_img = render_lower_third(
+                            t.name, t.score,
+                            bib=t.bib, nationality=t.team_code,
+                            bib_confirmed=t.bib_confirmed,
+                            country_iso3=t.nationality,
+                            uciid=t.uciid,
+                            team_name=t.team_name,
+                        )
+                    t._label_sig = sig  # type: ignore[attr-defined]
+                    if was_none:
+                        log(f"LBL+ track={t.id} '{t.name}' "
+                            f"score={t.score:.3f}")
             else:
+                if t.label_img is not None:
+                    log(f"LBL- track={t.id} '{t.name}' "
+                        f"score={t.score:.3f} (show={t.score >= show_thresh} "
+                        f"keep={t.score >= keep_thresh})")
                 t.label_img = None
+                t._label_sig = None  # type: ignore[attr-defined]
 
         # Fusion bib OCR : applique le cross-check après résolution face.
         # Si bibs OCR ont changé l'état d'un track (nouveau bib OU passage
         # confirmé), on re-render les labels affectés. La fonction met
         # aussi à jour t.body_track_id en passant (info utile association).
+        _timings["revote_loop"] = (time.monotonic()
+                                    - _t_section_revote) * 1000
+        _t_section_post_revote = time.monotonic()
         bibs_now = bibs_state.get()
         if bibs_now:
             bibs_changed = associate_bibs_to_tracks(active_tracks, bibs_now)
@@ -2775,11 +4144,21 @@ def processing_loop(cap, app: FaceAnalysis,
                 for t in active_tracks:
                     if t.label_img is None or t.score < THRESHOLD * 0.7:
                         continue
+                    # Idem branche re-vote : signature pour éviter le
+                    # re-render PIL si rien n'a changé visuellement.
+                    sig = (t.name, t.bib, t.team_code, t.team_name,
+                           t.nationality, t.bib_confirmed, t.uciid)
+                    if sig == getattr(t, "_label_sig", None):
+                        continue
                     t.label_img = render_lower_third(
                         t.name, t.score,
-                        bib=t.bib, nationality=t.nationality,
+                        bib=t.bib, nationality=t.team_code,
                         bib_confirmed=t.bib_confirmed,
+                        country_iso3=t.nationality,
+                        uciid=t.uciid,
+                        team_name=t.team_name,
                     )
+                    t._label_sig = sig  # type: ignore[attr-defined]
 
         # Snapshot capture (active learning) : sauve les crops face des
         # tracks reconnus avec très haute confiance + bib_confirmed dans
@@ -2849,13 +4228,46 @@ def processing_loop(cap, app: FaceAnalysis,
         # APRÈS pour rester au-dessus visuellement.
         if DRAW_BODIES and bodies_now:
             draw_bodies(frame, bodies_now)
+        _timings["post_revote_to_draw"] = (time.monotonic()
+                                            - _t_section_post_revote) * 1000
+        _t_section_draw = time.monotonic()
 
+        # Mask alpha (RVM) lu une seule fois par tick. Utilisé par :
+        #   - draw_scene_logo_behind si SCENE_LOGO_BEHIND=1
+        #   - draw_team_logos_behind si TEAM_LOGO_BEHIND=1
+        #   - draw_tracks (compositing label-behind) si MASK_BEHIND_LABELS=1
+        # Pas besoin de active_tracks pour scene-logo (indépendant des tracks).
+        mask_for_blend = None
+        if mask_reader is not None:
+            m = mask_reader.latest()
+            if m is not None and m.shape == frame.shape[:2]:
+                mask_for_blend = m
+
+        # Étape 0 : scene-logo arrière-plan (= couche la plus en fond).
+        if SCENE_LOGO_BEHIND:
+            draw_scene_logo_behind(frame, mask_for_blend)
+
+        # Étape 1 : logos équipe DERRIÈRE riders (couche intermédiaire).
+        if active_tracks and TEAM_LOGO_BEHIND:
+            draw_team_logos_behind(frame, active_tracks, mask_for_blend)
+
+        # Étape 2 : labels lower-third (devant les logos ; optionnellement
+        # derrière les riders via le même mask si MASK_BEHIND_LABELS=1).
         if active_tracks:
-            draw_tracks(frame, active_tracks, bodies_now)
+            mask_for_labels = mask_for_blend if MASK_BEHIND_LABELS else None
+            draw_tracks(frame, active_tracks, bodies_now, mask=mask_for_labels)
 
+        # Overlay chrono en bas-droite (plaque 3D pseudo-warp + bevel).
+        # Toggle via CLOCK_ENABLED env. Cache interne par seconde.
+        overlay_clock(frame)
+
+        _timings["draw_tracks"] = (time.monotonic()
+                                    - _t_section_draw) * 1000
+        _t_b = time.monotonic()
         # Met à jour la dernière frame native dispo (utile si un POST
         # /bullet-time arrive : on freeze ce contenu). Avant warp.
         bullet_state.update_live(frame)
+        _timings["bullet_update"] = (time.monotonic() - _t_b) * 1000
 
         # Bullet time : si actif, on REMPLACE la frame courante par la
         # frame freezée warpée selon l'angle yaw animé. Tous les overlays
@@ -2875,29 +4287,48 @@ def processing_loop(cap, app: FaceAnalysis,
             except Exception as e:
                 log(f"NDI out send err: {e}")
 
+        _t_r = time.monotonic()
         # Downscale optionnel avant encode JPEG (allège le décodage browser à
-        # haut fps). Garde le ratio source. INTER_AREA = bonne qualité downscale.
+        # haut fps). Garde le ratio source. INTER_LINEAR pour la vitesse —
+        # INTER_AREA prenait 17-20ms à 1080p→720p sur cette box (mesuré
+        # 2026-05-29) alors qu'INTER_LINEAR fait le même downscale en ~3ms,
+        # qualité visuelle négligeablement différente après JPEG.
         if PUBLISH_HEIGHT and frame.shape[0] > PUBLISH_HEIGHT:
             ratio = PUBLISH_HEIGHT / frame.shape[0]
             new_w = int(round(frame.shape[1] * ratio))
             frame = cv2.resize(frame, (new_w, PUBLISH_HEIGHT),
-                               interpolation=cv2.INTER_AREA)
+                               interpolation=cv2.INTER_LINEAR)
+        _timings["resize"] = (time.monotonic() - _t_r) * 1000
 
+        _t_pre_enc = time.monotonic()
         # Encode + push MJPEG /stream.mjpeg UNIQUEMENT si au moins un
         # client browser regarde le preview. body_recog + bib_recog ne
         # consomment plus le MJPEG (ils lisent en SHM), donc 0 subscribers
         # = personne ne regarde = pas d'encode = ~30% CPU libérée.
         if fbuf.subscribers > 0:
-            ok, buf = cv2.imencode(".jpg", frame,
-                                    [cv2.IMWRITE_JPEG_QUALITY, JPEG_QUALITY])
-            if ok:
-                fbuf.push(bytes(buf))
+            buf_bytes = _gpu_encode_or_cv2(frame)
+            if buf_bytes is not None:
+                fbuf.push(buf_bytes)
+        _t_end = time.monotonic()
+        _total_ms = (_t_end - _t0) * 1000
+        if _total_ms > 25:
+            _enc_ms = (_t_end - _t_pre_enc) * 1000
+            parts = " ".join(f"{k}={v:.1f}"
+                              for k, v in _timings.items() if v >= 1.0)
+            log(f"STALL {_total_ms:.0f}ms encode={_enc_ms:.0f}ms "
+                f"[{parts}] tracks={len(active_tracks)}")
 
         # Si quelqu'un consomme le flux skeleton, on rend la vue
         # séparée et on push. Skip render quand 0 client (économie CPU).
         if skel_buf.subscribers > 0:
             skel = np.zeros_like(frame)
-            draw_skeleton_view(skel, bodies_now, active_tracks)
+            # `bodies_now` a été calculé avec target=frame.shape AVANT
+            # le resize ligne 3800. `skel` est zeros_like(frame post-resize)
+            # donc 720p si PUBLISH_HEIGHT actif → re-query avec les dims
+            # actuelles du skel canvas, sinon offsets visibles.
+            sk_h, sk_w = skel.shape[:2]
+            sk_bodies = bodies_state.get_persons(target_w=sk_w, target_h=sk_h)
+            draw_skeleton_view(skel, sk_bodies, active_tracks)
             ok2, sbuf = cv2.imencode(".jpg", skel,
                                       [cv2.IMWRITE_JPEG_QUALITY, JPEG_QUALITY])
             if ok2:
@@ -2925,6 +4356,7 @@ class MJPEGHandler(BaseHTTPRequestHandler):
     # Références injectées via attributs classe par main().
     fbuf: FrameBuffer = None
     skel_buf: FrameBuffer = None
+    cap_worker: "CaptureWorker | None" = None
 
     def log_message(self, format, *args):  # noqa: D401 - silence default logs
         pass  # already logging via processing thread
@@ -2983,26 +4415,97 @@ class MJPEGHandler(BaseHTTPRequestHandler):
             self.send_header("Content-Type", "text/plain")
             self.end_headers()
             self.wfile.write(b"ok\n")
+        elif self.path == "/pause":
+            # GET /pause → renvoie l'état courant {paused: bool}
+            cw = MJPEGHandler.cap_worker
+            paused = bool(cw and cw.is_paused())
+            body = f'{{"paused": {str(paused).lower()}}}\n'.encode()
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
         else:
             self.send_response(404)
             self.end_headers()
 
     def _serve_fullscreen(self, stream_path: str, title: str) -> None:
-        html = (
-            "<!DOCTYPE html><html><head>"
-            f"<title>{title}</title>"
-            "<meta charset=\"utf-8\">"
-            "<meta name=\"viewport\" content=\"width=device-width,"
-            "initial-scale=1\">"
-            "<style>"
-            "html,body{margin:0;padding:0;height:100%;background:#000;"
-            "overflow:hidden;cursor:none;}"
-            "img{display:block;width:100vw;height:100vh;"
-            "object-fit:contain;}"
-            "</style></head><body>"
-            f"<img src=\"{stream_path}\" alt=\"\">"
-            "</body></html>"
-        ).encode("utf-8")
+        # Page strictement alignée sur celle du studio webui Go
+        # (cmd/avtowan-webui → /face-recog) : même HTML, même CSS, même
+        # <header>+<main>+<img>, mêmes interactions (skeleton toggle,
+        # fullscreen, bullet-time). Seules les URLs sont locales :
+        # /stream.mjpeg au lieu de /face-recog/stream.mjpeg, etc.
+        # Garantit l'identité visuelle (sizing image, scaling browser)
+        # entre l'arbox et le studio — sinon CSS divergente = upscaling
+        # bilinéaire qui rend visible la quantification JPEG (flicker).
+        del title  # arbox utilise le titre studio
+        del stream_path  # idem, sources hardcodées comme côté studio
+        html = """<!DOCTYPE html>
+<html lang="fr">
+<head>
+<meta charset="utf-8">
+<title>AVtoWan — Reconnaissance faciale</title>
+<style>
+  body { margin: 0; background: #000; color: #c9d1d9; font-family: -apple-system,BlinkMacSystemFont,sans-serif; }
+  header { padding: 8px 16px; background: #161b22; border-bottom: 1px solid #30363d;
+           display: flex; align-items: center; gap: 16px; }
+  header h1 { margin: 0; font-size: 14px; font-weight: 600; color: #a371f7; }
+  header .meta { font-size: 11px; color: #8b949e; }
+  header button { margin-left: auto; background: #21262d; color: #c9d1d9;
+                  border: 1px solid #30363d; border-radius: 4px;
+                  padding: 4px 10px; font-size: 12px; cursor: pointer; }
+  header button:hover { background: #30363d; }
+  main { display: flex; justify-content: center; align-items: center;
+         min-height: calc(100vh - 38px); padding: 8px; }
+  img { max-width: 100%; max-height: calc(100vh - 60px); object-fit: contain;
+        border-radius: 4px; background: #0d1117; cursor: zoom-in; }
+  /* Mode fullscreen sur l'image seule : remplir l'écran, fond noir, curseur de sortie */
+  img:fullscreen { max-height: 100vh; max-width: 100vw; border-radius: 0;
+                   width: 100vw; height: 100vh; cursor: zoom-out; }
+  a { color: #58a6ff; text-decoration: none; }
+  a:hover { text-decoration: underline; }
+</style>
+</head>
+<body>
+<header>
+  <h1>Reconnaissance faciale</h1>
+  <span class="meta">Source : NDI / UDP HEVC depuis studio</span>
+  <span class="meta">·</span>
+  <span class="meta">Modèle : InsightFace buffalo_l (RetinaFace + ArcFace) sur RTX 3080</span>
+  <button id="skel-btn" onclick="toggleSkeleton(this)" title="Bascule entre flux vidéo annoté et fond noir + squelettes + photos">⛶ Skeleton</button>
+  <button onclick="fs()" title="Plein écran (Esc pour sortir)">⛶ Plein écran</button>
+</header>
+<main>
+  <img id="stream" src="/stream.mjpeg" alt="flux annoté" onclick="fs()">
+</main>
+<script>
+  function fs() {
+    var el = document.getElementById('stream');
+    if (document.fullscreenElement) {
+      document.exitFullscreen();
+    } else if (el.requestFullscreen) {
+      el.requestFullscreen();
+    }
+  }
+  var SKEL_SRC = '/stream-skeleton.mjpeg';
+  var VIDEO_SRC = '/stream.mjpeg';
+  function refreshSkeletonBtn(enabled) {
+    var btn = document.getElementById('skel-btn');
+    if (!btn) return;
+    btn.textContent = enabled ? '◼ Skeleton ON' : '⛶ Skeleton';
+    btn.style.background = enabled ? '#3d2a4a' : '#21262d';
+    btn.style.borderColor = enabled ? '#a371f7' : '#30363d';
+  }
+  function toggleSkeleton(btn) {
+    var img = document.getElementById('stream');
+    var on = img.src.indexOf('stream-skeleton') === -1;
+    var sep = '?t=' + Date.now();
+    img.src = (on ? SKEL_SRC : VIDEO_SRC) + sep;
+    refreshSkeletonBtn(on);
+  }
+</script>
+</body>
+</html>""".encode("utf-8")
         self.send_response(200)
         self.send_header("Content-Type", "text/html; charset=utf-8")
         self.send_header("Content-Length", str(len(html)))
@@ -3014,6 +4517,32 @@ class MJPEGHandler(BaseHTTPRequestHandler):
             pass
 
     def do_POST(self):
+        if self.path in ("/pause", "/resume", "/pause/toggle"):
+            # POST /pause   → set pause
+            # POST /resume  → clear pause
+            # POST /pause/toggle → toggle
+            cw = MJPEGHandler.cap_worker
+            if cw is None:
+                body = b'{"ok":false,"reason":"capture worker not ready"}'
+                code = 503
+            else:
+                if self.path == "/pause":
+                    cw.set_paused(True)
+                elif self.path == "/resume":
+                    cw.set_paused(False)
+                else:
+                    cw.set_paused(not cw.is_paused())
+                body = f'{{"ok":true,"paused":{str(cw.is_paused()).lower()}}}'.encode()
+                code = 200
+            self.send_response(code)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            try:
+                self.wfile.write(body)
+            except (BrokenPipeError, ConnectionResetError):
+                pass
+            return
         if self.path == "/bullet-time":
             # Trigger bullet-time : lit la dernière depth dispo + freeze
             # la dernière frame live. Réponse JSON : {ok, reason}.
@@ -3049,8 +4578,30 @@ def main() -> None:
 
     log(f"init détecteur {INSIGHTFACE_MODEL}...")
     t0 = time.monotonic()
-    providers = (["CUDAExecutionProvider", "CPUExecutionProvider"] if GPU_ID >= 0
-                 else ["CPUExecutionProvider"])
+    # Provider priority : Tensorrt > CUDA > CPU. Tensorrt = engines précompilés
+    # 2-4× plus rapide que CUDA EP pour SCRFD + ArcFace. Le 1er run par modèle
+    # compile l'engine (~30 s) puis cache dans TRT_ENGINE_CACHE_PATH (default
+    # /tmp/onnxruntime_trt_cache). Toggle off via USE_TRT=0 en cas de pb.
+    USE_TRT = bool(int(env("USE_TRT", "1")))
+    if GPU_ID >= 0:
+        if USE_TRT:
+            trt_cache = env("TRT_ENGINE_CACHE_PATH",
+                             "/var/cache/face-recog/trt-engines")
+            os.makedirs(trt_cache, exist_ok=True)
+            providers = [
+                ("TensorrtExecutionProvider", {
+                    "trt_engine_cache_enable": True,
+                    "trt_engine_cache_path": trt_cache,
+                    "trt_fp16_enable": True,
+                    "device_id": GPU_ID,
+                }),
+                "CUDAExecutionProvider",
+                "CPUExecutionProvider",
+            ]
+        else:
+            providers = ["CUDAExecutionProvider", "CPUExecutionProvider"]
+    else:
+        providers = ["CPUExecutionProvider"]
     app = FaceAnalysis(name=INSIGHTFACE_MODEL, providers=providers)
     app.prepare(ctx_id=GPU_ID, det_size=(DET_SIZE, DET_SIZE))
     log(f"détecteur ready en {time.monotonic() - t0:.1f}s")
@@ -3078,6 +4629,57 @@ def main() -> None:
     else:
         log(f"manifest rider absent/vide ({RIDER_MANIFEST_JSON}) — photos "
             f"limitées aux UCI IDs des partants")
+
+    # Pre-warm portrait cache : charge tous les portraits des partants au
+    # boot pour éviter les ~20 ms spike disk-read au 1er render de chaque
+    # label. À 200 riders × ~20 ms = ~4 s de boot supplémentaire, mais
+    # tue les pics de revote_loop quand un nouveau rider apparaît.
+    if PORTRAIT_PREWARM:
+        # Compute portrait target_h identique à render_lower_third (2 lignes,
+        # tag size = ~70 px). Si la résolution change plus tard, le cache
+        # est invalidé naturellement par (uciid, h) key — coût juste un
+        # 2e load.
+        _approx_content_h = 70
+        n_loaded = 0
+        for name, meta in _RIDERS_META.items():
+            uciid = meta.get("uciid") or _NAME_TO_UCIID.get(name)
+            if uciid and _load_portrait(uciid,
+                                          target_h=_approx_content_h) is not None:
+                n_loaded += 1
+        log(f"portrait cache prewarm : {n_loaded}/{len(_RIDERS_META)} riders")
+
+    # Pre-render TOUS les labels au boot. Chaque label PIL = ~10-15 ms à
+    # rendre ; si on les fait au runtime dans la revote loop, ça spike la
+    # publish loop (cluster de votes en lockstep = stutter visible).
+    # En pré-rendant, la revote loop devient : match() + dict lookup, ~1 ms.
+    # Stockage : (name, bib, team_code, team_name, nationality, uciid,
+    # bib_confirmed=False) → BGRA premul. bib_confirmed=True n'est pas
+    # pré-rendu (rare, recharge à la première occurrence — OCR off de toute
+    # façon).
+    global _LABEL_PRERENDER_CACHE
+    _LABEL_PRERENDER_CACHE = {}
+    if LABEL_PRERENDER:
+        n_pre = 0
+        t_pre_start = time.monotonic()
+        for name, meta in _RIDERS_META.items():
+            uciid = meta.get("uciid") or _NAME_TO_UCIID.get(name)
+            bib = meta.get("bib")
+            try:
+                img = render_lower_third(
+                    name, score=0.0,
+                    bib=bib, nationality=meta.get("team_code"),
+                    bib_confirmed=False,
+                    country_iso3=meta.get("nationality"),
+                    uciid=uciid,
+                    team_name=meta.get("team_name"),
+                )
+                _LABEL_PRERENDER_CACHE[name] = img
+                n_pre += 1
+            except Exception as e:
+                log(f"prerender err name={name}: {e}")
+        dt = (time.monotonic() - t_pre_start) * 1000
+        log(f"label prerender : {n_pre}/{len(_RIDERS_META)} riders "
+            f"({dt:.0f} ms)")
 
     cap = open_source(SOURCE)
     fbuf = FrameBuffer()

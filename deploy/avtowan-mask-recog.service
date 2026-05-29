@@ -1,0 +1,29 @@
+[Unit]
+Description=AVtoWan mask recog — RVM matting GPU, mask alpha pour compositing labels-derrière-riders
+After=network.target avtowan-face-recog.service
+Wants=avtowan-face-recog.service
+
+[Service]
+Type=simple
+User=ben
+Group=ben
+WorkingDirectory=/opt/avtowan-mask-recog
+
+# Defaults — override via /etc/avtowan/mask-recog.env
+Environment=RVM_MODEL=/opt/avtowan-mask-recog/rvm_mobilenetv3_fp16.onnx
+Environment=SHM_FRAME_NAME=arbox-frame
+Environment=SHM_MASK_NAME=avtowan-mask
+Environment=DOWNSAMPLE_RATIO=0.4
+Environment=MAX_FPS=60
+Environment=GPU_ID=0
+EnvironmentFile=-/etc/avtowan/mask-recog.env
+
+ExecStart=/opt/avtowan-mask-recog/venv/bin/python3 /opt/avtowan-mask-recog/mask_recog_service.py
+
+Restart=on-failure
+RestartSec=5
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

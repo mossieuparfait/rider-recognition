@@ -123,6 +123,39 @@ TEAM_LOGO_HEIGHT = int(env("TEAM_LOGO_HEIGHT", "400"))
 # alignées en row centré.
 TEAM_LOGO_Y_FRACTION = float(env("TEAM_LOGO_Y_FRACTION", "0.4"))
 TEAM_LOGO_SPACING_PX = int(env("TEAM_LOGO_SPACING_PX", "60"))
+
+# Tableau "compo équipe" affiché au-dessus de la tête d'un rider reconnu
+# (mode podium). Toggle au boot via SHOW_TEAM_ROSTER, mutable à chaud via
+# POST /podium-mode {"on": bool} ou POST /podium-mode/toggle.
+SHOW_TEAM_ROSTER = bool(int(env("SHOW_TEAM_ROSTER", "0")))
+TEAM_ROSTER_FONT_SIZE = int(env("TEAM_ROSTER_FONT_SIZE", "22"))
+TEAM_ROSTER_HEADER_FONT_SIZE = int(env("TEAM_ROSTER_HEADER_FONT_SIZE", "24"))
+TEAM_ROSTER_GAP_PX = int(env("TEAM_ROSTER_GAP_PX", "30"))
+TEAM_ROSTER_MARGIN_PX = int(env("TEAM_ROSTER_MARGIN_PX", "18"))
+TEAM_ROSTER_BG_ALPHA = float(env("TEAM_ROSTER_BG_ALPHA", "0.78"))
+TEAM_ROSTER_ACCENT_HEX = env("TEAM_ROSTER_ACCENT_HEX", "#a371f7")
+# Position fixe du tableau : fraction de la hauteur frame pour le bord
+# haut de la carte. 0.04 = ~4% du haut. X est toujours centré sur le
+# frame (pas attaché à un rider).
+TEAM_ROSTER_TOP_Y_FRACTION = float(env("TEAM_ROSTER_TOP_Y_FRACTION", "0.04"))
+# Sticky court : on ne change l'équipe affichée qu'après ce délai de
+# stabilité d'une équipe challenger majoritaire. Tue le ping-pong quand
+# le compte d'apparitions oscille frame-à-frame.
+TEAM_ROSTER_STICKY_S = float(env("TEAM_ROSTER_STICKY_S", "2.0"))
+# Si aucun rider reconnu n'apparaît pendant ce délai (s), le tableau
+# disparaît. Permet de cacher la card en off-shot sans toucher au
+# toggle global. Mettre à 0 pour ne jamais cacher (la dernière équipe
+# vue reste à l'écran tant que le mode est ON).
+TEAM_ROSTER_IDLE_HIDE_S = float(env("TEAM_ROSTER_IDLE_HIDE_S", "10.0"))
+# Chroma-key fond plateau : le tableau ne s'incruste QUE là où le pixel
+# de la frame est proche de la couleur clé (= fond gris). Sur les
+# personnes / micros / mobilier qui dépassent, le tableau s'efface
+# naturellement → effet "fondu plateau". Réutilise les paramètres
+# SCENE_LOGO_KEY_BGR / _TOLERANCE / _SOFTNESS (même scène, même fond).
+# Si un mask RVM est dispo (MASK_BEHIND_LABELS=1), on prend l'UNION
+# des deux : chroma capte les objets non-humains, RVM capte les
+# vêtements de couleur proche du fond.
+TEAM_ROSTER_CHROMA_KEY = bool(int(env("TEAM_ROSTER_CHROMA_KEY", "1")))
 GPU_ID       = int(env("GPU_ID", "0"))
 # Modèle InsightFace : buffalo_l (default, ~280 MB VRAM, rapide, précision
 # correcte) ou antelopev2 (~600 MB VRAM, ~3× plus lent mais +30% précision
@@ -2509,6 +2542,120 @@ def load_riders_meta(json_path: str | None) -> dict[str, dict]:
     return out
 
 
+# Map team_code → {name, riders: [{bib, lastname, firstname, lastnameshort}]}
+# trié par bib. Alimenté depuis le JSON partants ASO au boot.
+_TEAM_ROSTERS: dict[str, dict] = {}
+
+
+def load_team_rosters(json_path: str | None) -> dict[str, dict]:
+    """Parse le JSON partants ASO et renvoie {team_code → {name, riders}}.
+
+    `riders` est trié par bib (asc), chaque entrée garde firstname,
+    lastname, lastnameshort et bib (int|None). Sert au rendu du tableau
+    "compo équipe" en mode podium.
+    """
+    if not json_path or not os.path.exists(json_path):
+        return {}
+    try:
+        with open(json_path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+    except Exception as e:
+        print(f"[face-recog] partants JSON (rosters): échec lecture: {e}",
+              file=sys.stderr, flush=True)
+        return {}
+    out: dict[str, dict] = {}
+    for team in data.get("teams", []) or []:
+        team_code = team.get("code") or ""
+        if not team_code:
+            continue
+        team_name = team.get("name") or team_code
+        riders: list[dict] = []
+        for r in team.get("riders", []) or []:
+            try:
+                bib_val = int(r.get("bib")) if r.get("bib") is not None else None
+            except (TypeError, ValueError):
+                bib_val = None
+            riders.append({
+                "bib": bib_val,
+                "firstname": r.get("firstname") or "",
+                "lastname": r.get("lastname") or "",
+                "lastnameshort": r.get("lastnameshort") or r.get("lastname") or "",
+                "uciid": r.get("uciid") or "",
+            })
+        riders.sort(key=lambda x: (x["bib"] is None, x["bib"] or 0))
+        out[team_code] = {"name": team_name, "riders": riders}
+    return out
+
+
+class PodiumState:
+    """Toggle thread-safe pour l'affichage du tableau compo équipe.
+
+    Lu par draw_tracks (publish loop) et écrit par les requêtes HTTP
+    POST /podium-mode. Pas d'EMA / d'historique : le seul état est le
+    bool. La sélection du rider central (et son sticky) vit dans une
+    structure séparée côté draw_tracks pour ne pas mélanger les
+    préoccupations.
+    """
+
+    def __init__(self, initial: bool = False) -> None:
+        self._lock = threading.Lock()
+        self._enabled = bool(initial)
+
+    def is_enabled(self) -> bool:
+        with self._lock:
+            return self._enabled
+
+    def set_enabled(self, v: bool) -> bool:
+        with self._lock:
+            self._enabled = bool(v)
+            return self._enabled
+
+    def toggle(self) -> bool:
+        with self._lock:
+            self._enabled = not self._enabled
+            return self._enabled
+
+
+podium_state = PodiumState(initial=SHOW_TEAM_ROSTER)
+
+
+class LayoutState:
+    """État du layout des lower-thirds rider (toggle on/off).
+
+    Modes :
+      - "solo" : labels rider au-dessus de chaque visage (comportement
+        par défaut, identique à avant l'introduction du toggle).
+      - "none" : aucun label rider rendu sur la frame. Le tracking et
+        la reco restent actifs (sélection rider central pour le tableau
+        compo équipe continue de fonctionner).
+    """
+
+    _VALID = ("solo", "none")
+
+    def __init__(self, initial: str = "solo") -> None:
+        self._lock = threading.Lock()
+        self._mode = initial if initial in self._VALID else "solo"
+
+    def mode(self) -> str:
+        with self._lock:
+            return self._mode
+
+    def set_mode(self, v: str) -> str:
+        with self._lock:
+            if v in self._VALID:
+                self._mode = v
+            return self._mode
+
+    def toggle(self) -> str:
+        with self._lock:
+            self._mode = "none" if self._mode == "solo" else "solo"
+            return self._mode
+
+
+LAYOUT_MODE_INITIAL = env("LAYOUT_MODE", "solo")
+layout_state = LayoutState(initial=LAYOUT_MODE_INITIAL)
+
+
 _LABEL_SIMPLE = bool(int(env("LABEL_SIMPLE", "0")))
 
 
@@ -2846,6 +2993,270 @@ def composite_bgra(frame_bgr: np.ndarray, label_bgra: np.ndarray,
         label_contrib = label[:, :, :3].astype(np.float32)
     inv_a = 1.0 - label_alpha_norm
     roi[:] = (label_contrib + inv_a * roi).astype(np.uint8)
+
+
+# ─────────────── Tableau "compo équipe" (mode podium) ──────────────────
+# Cache des cartes pré-rendues par (team_code, highlight_bib). Invalide
+# implicitement quand on touche aux env vars (= restart service).
+_TEAM_ROSTER_CACHE: dict[tuple, np.ndarray] = {}
+
+
+def _font_roster_body() -> ImageFont.FreeTypeFont:
+    """Police corps du tableau (taille TEAM_ROSTER_FONT_SIZE)."""
+    return ImageFont.truetype(_FONT_PATH, TEAM_ROSTER_FONT_SIZE)
+
+
+def _font_roster_header() -> ImageFont.FreeTypeFont:
+    """Police header (nom équipe), légèrement plus grosse."""
+    return ImageFont.truetype(_FONT_PATH, TEAM_ROSTER_HEADER_FONT_SIZE)
+
+
+def _hex_to_rgb(hex_str: str) -> tuple[int, int, int]:
+    s = hex_str.lstrip("#")
+    if len(s) != 6:
+        return (163, 113, 247)  # accent par défaut
+    try:
+        return (int(s[0:2], 16), int(s[2:4], 16), int(s[4:6], 16))
+    except ValueError:
+        return (163, 113, 247)
+
+
+TEAM_ROSTER_PORTRAIT_H = int(env("TEAM_ROSTER_PORTRAIT_H", "78"))
+TEAM_ROSTER_LOGO_H = int(env("TEAM_ROSTER_LOGO_H", "64"))
+
+
+def _make_rider_cartouche_pil(r: dict, accent_outline: tuple | None,
+                               highlight: bool) -> "Image.Image":
+    """Mini lower-third individuel pour un rider : fond arrondi sombre,
+    photo carrée à gauche, bib + Firstname LASTNAME complet à droite.
+    Style strictement aligné sur render_lower_third (radius 14, drop
+    shadow 1 px, fond (15,18,26,140)).
+    """
+    portrait_h = TEAM_ROSTER_PORTRAIT_H
+    font_bib = _FONT_SMALL
+    font_name = _FONT
+    radius = 14
+    pad = 10
+    portrait_gap = 10
+
+    ln = (r.get("lastname") or "").upper()
+    fn = (r.get("firstname") or "").strip()
+    name_str = f"{fn} {ln}" if (fn and ln) else (fn or ln)
+    bib_val = r.get("bib")
+    bib_str = f"{bib_val}" if isinstance(bib_val, int) else "·"
+
+    dummy = Image.new("RGBA", (8, 8), (0, 0, 0, 0))
+    dd = ImageDraw.Draw(dummy)
+    bbox_bib = dd.textbbox((0, 0), bib_str, font=font_bib)
+    bbox_name = dd.textbbox((0, 0), name_str, font=font_name)
+    bib_w = bbox_bib[2] - bbox_bib[0]
+    bib_h = bbox_bib[3] - bbox_bib[1]
+    name_w = bbox_name[2] - bbox_name[0]
+    name_h = bbox_name[3] - bbox_name[1]
+
+    text_w = max(bib_w, name_w)
+    inner_w = portrait_h + portrait_gap + text_w
+    inner_h = portrait_h
+    w = inner_w + pad * 2
+    h_label = inner_h + pad * 2
+    h = h_label + 2  # marge pour drop shadow
+
+    img = Image.new("RGBA", (w, h), (0, 0, 0, 0))
+    draw = ImageDraw.Draw(img)
+    draw.rounded_rectangle((1, 2, w - 1, h_label),
+                           radius=radius, fill=(0, 0, 0, 60))
+    draw.rounded_rectangle((0, 0, w - 2, h_label - 1),
+                           radius=radius, fill=(15, 18, 26, 140))
+
+    # Portrait carré à gauche.
+    px = pad
+    py = pad
+    portrait = _load_portrait(r.get("uciid") or None,
+                               target_h=portrait_h)
+    if portrait is not None:
+        ph = portrait.height
+        pw = portrait.width
+        if ph != portrait_h or pw != portrait_h:
+            portrait = portrait.resize((portrait_h, portrait_h),
+                                        Image.Resampling.LANCZOS)
+        img.paste(portrait, (px, py), portrait)
+    else:
+        draw.rectangle((px, py, px + portrait_h, py + portrait_h),
+                       fill=(30, 34, 44, 220))
+        initial = (fn or ln or "?")[0].upper()
+        bbi = dd.textbbox((0, 0), initial, font=font_name)
+        ix = px + (portrait_h - (bbi[2] - bbi[0])) // 2 - bbi[0]
+        iy = py + (portrait_h - (bbi[3] - bbi[1])) // 2 - bbi[1]
+        draw.text((ix, iy), initial, font=font_name,
+                  fill=(180, 184, 196, 240))
+    if accent_outline is not None:
+        draw.rectangle(
+            (px - 1, py - 1, px + portrait_h, py + portrait_h),
+            outline=(accent_outline[0], accent_outline[1],
+                      accent_outline[2], 255),
+            width=2,
+        )
+
+    # Bib + nom à droite.
+    tx = px + portrait_h + portrait_gap
+    mid_y = py + portrait_h // 2
+    bib_y = mid_y - bib_h - 4 - bbox_bib[1]
+    name_y = mid_y + 2 - bbox_name[1]
+    draw.text((tx, bib_y), bib_str, font=font_bib,
+              fill=(235, 235, 240, 230))
+    if highlight:
+        draw.text((tx + 1, name_y + 1), name_str, font=font_name,
+                  fill=(0, 0, 0, 200))
+        draw.text((tx, name_y), name_str, font=font_name,
+                  fill=(255, 255, 255, 255))
+    else:
+        draw.text((tx, name_y), name_str, font=font_name,
+                  fill=(225, 227, 235, 240))
+    return img
+
+
+def _make_team_header_cartouche_pil(team_code: str,
+                                     team_name: str) -> "Image.Image":
+    """Cartouche header : logo équipe (PNG team-logos) + nom équipe.
+
+    Même style que les cartouches rider (fond arrondi sombre, drop
+    shadow). Si le logo est absent on rend juste le nom.
+    """
+    logo_h = TEAM_ROSTER_LOGO_H
+    radius = 14
+    pad = 12
+    gap = 16
+    font_hdr = _FONT
+
+    # Charge le logo en alpha complet (sans la modulation 0.5 de
+    # get_team_logo_sized qui est faite pour le rendu "derrière rider").
+    logo_pil: "Image.Image | None" = None
+    raw = _load_team_logo_raw(team_code)
+    if raw is not None:
+        bh, bw = raw.shape[:2]
+        new_w = max(1, int(round(bw * logo_h / bh)))
+        sized = cv2.resize(raw, (new_w, logo_h), interpolation=cv2.INTER_AREA)
+        # BGRA → RGBA pour PIL.
+        rgba = sized[:, :, [2, 1, 0, 3]].copy()
+        logo_pil = Image.fromarray(rgba, mode="RGBA")
+
+    name_str = (team_name or team_code).upper()
+    dummy = Image.new("RGBA", (8, 8), (0, 0, 0, 0))
+    dd = ImageDraw.Draw(dummy)
+    bbox = dd.textbbox((0, 0), name_str, font=font_hdr)
+    name_w = bbox[2] - bbox[0]
+    name_h = bbox[3] - bbox[1]
+
+    logo_w = logo_pil.width if logo_pil is not None else 0
+    inner_w = logo_w + (gap if logo_pil is not None else 0) + name_w
+    inner_h = max(logo_h, name_h + 4)
+    w = inner_w + pad * 2
+    h_label = inner_h + pad * 2
+    h = h_label + 2
+
+    img = Image.new("RGBA", (w, h), (0, 0, 0, 0))
+    draw = ImageDraw.Draw(img)
+    draw.rounded_rectangle((1, 2, w - 1, h_label),
+                           radius=radius, fill=(0, 0, 0, 60))
+    draw.rounded_rectangle((0, 0, w - 2, h_label - 1),
+                           radius=radius, fill=(15, 18, 26, 160))
+
+    cur_x = pad
+    if logo_pil is not None:
+        ly = pad + (inner_h - logo_h) // 2
+        img.paste(logo_pil, (cur_x, ly), logo_pil)
+        cur_x += logo_w + gap
+    ny = pad + (inner_h - name_h) // 2 - bbox[1]
+    draw.text((cur_x + 1, ny + 1), name_str, font=font_hdr,
+              fill=(0, 0, 0, 200))
+    draw.text((cur_x, ny), name_str, font=font_hdr,
+              fill=(255, 255, 255, 255))
+    return img
+
+
+def render_team_roster_card(team_code: str,
+                             highlight_bib: int | None) -> "np.ndarray | None":
+    """Compose le tableau compo équipe : cartouche header (logo + nom)
+    + 8 cartouches rider indépendants en grille 3-3-2 (3 colonnes).
+
+    Chaque cartouche est un mini lower-third autonome (fond arrondi,
+    drop shadow) pour un effet broadcast. Le rider courant
+    (bib == highlight_bib) a un liseré accent sur sa photo + nom blanc.
+
+    Renvoie BGRA pré-multiplié (compat composite_bgra). None si
+    team_code inconnu ou roster vide.
+    """
+    team = _TEAM_ROSTERS.get(team_code)
+    if not team:
+        return None
+    riders = team.get("riders") or []
+    if not riders:
+        return None
+
+    cache_key = (team_code, highlight_bib)
+    cached = _TEAM_ROSTER_CACHE.get(cache_key)
+    if cached is not None:
+        return cached
+
+    accent = _hex_to_rgb(TEAM_ROSTER_ACCENT_HEX)
+    cols: list[list[dict]] = [riders[0:3], riders[3:6], riders[6:8]]
+
+    # 1) Pré-rendu des cartouches rider individuels (par colonne).
+    rider_cards: list[list["Image.Image"]] = []
+    max_card_w = 0
+    max_card_h = 0
+    for col in cols:
+        col_imgs = []
+        for r in col:
+            is_hl = (highlight_bib is not None
+                     and isinstance(r.get("bib"), int)
+                     and r["bib"] == highlight_bib)
+            card = _make_rider_cartouche_pil(
+                r, accent_outline=accent if is_hl else None,
+                highlight=is_hl,
+            )
+            col_imgs.append(card)
+            if card.width > max_card_w:
+                max_card_w = card.width
+            if card.height > max_card_h:
+                max_card_h = card.height
+        rider_cards.append(col_imgs)
+
+    # 2) Pré-rendu du cartouche header (logo + nom équipe).
+    team_name = team.get("name") or team_code
+    header_card = _make_team_header_cartouche_pil(team_code, team_name)
+
+    # 3) Layout global.
+    col_gap = 16
+    row_gap = 12
+    header_gap = 16  # entre le header et la grille de riders
+    rows = 3  # colonnes 1 et 2 ont 3 riders, colonne 3 en a 2
+    grid_w = max_card_w * len(cols) + col_gap * (len(cols) - 1)
+    grid_h = max_card_h * rows + row_gap * (rows - 1)
+    canvas_w = max(grid_w, header_card.width)
+    canvas_h = header_card.height + header_gap + grid_h
+
+    canvas = Image.new("RGBA", (canvas_w, canvas_h), (0, 0, 0, 0))
+    # Header centré.
+    hx = (canvas_w - header_card.width) // 2
+    canvas.alpha_composite(header_card, (hx, 0))
+
+    # Grille rider, centrée si le header est plus large que la grille.
+    grid_x0 = (canvas_w - grid_w) // 2
+    grid_y0 = header_card.height + header_gap
+    for ci, col_imgs in enumerate(rider_cards):
+        col_x = grid_x0 + ci * (max_card_w + col_gap)
+        for ri, card in enumerate(col_imgs):
+            cy = grid_y0 + ri * (max_card_h + row_gap)
+            canvas.alpha_composite(card, (col_x, cy))
+
+    rgba = np.array(canvas, dtype=np.uint8)
+    bgra = rgba[:, :, [2, 1, 0, 3]].copy()
+    a = bgra[:, :, 3:4].astype(np.float32) * (1.0 / 255.0)
+    bgra[:, :, :3] = (bgra[:, :, :3].astype(np.float32) * a).astype(np.uint8)
+
+    _TEAM_ROSTER_CACHE[cache_key] = bgra
+    return bgra
 
 
 # ──────────────────────── Team logos (rendu derrière riders) ─────────────
@@ -3520,6 +3931,190 @@ def _dedup_by_name_latched(placeable):
     return kept
 
 
+# Scratch buffer (H, W) uint8 pour le mask chroma du tableau podium :
+# alloué une seule fois à la résolution frame, réutilisé à chaque
+# frame. On n'écrit que la ROI du tableau, le reste n'est jamais lu par
+# composite_bgra (il indexe mask[y0:y1, x0:x1] uniquement). Évite
+# l'alloc 2 MB/frame qui massacrait les fps.
+_PODIUM_CHROMA_SCRATCH: "np.ndarray | None" = None
+
+
+# Sticky de l'équipe affichée dans le tableau compo. L'équipe
+# affichée = celle la plus représentée parmi les riders reconnus à
+# l'écran. On ne change qu'après TEAM_ROSTER_STICKY_S consécutives où
+# une autre équipe est majoritaire, sinon on garde la dernière. Si
+# plus aucun rider reconnu depuis TEAM_ROSTER_IDLE_HIDE_S, la carte
+# disparaît.
+#
+# Position d'affichage lissée (EMA + deadzone + snap) sur le même
+# modèle que les labels rider : `display_x` / `display_y` flottent
+# vers la target avec _LABEL_SMOOTH_ALPHA ; on ignore les variations
+# < _LABEL_TARGET_DEADZONE_PX (anti-jitter) ; on snap au-delà de
+# _LABEL_SNAP_PX (changement de plan / re-id). Tue le "le tableau qui
+# bouge à chaque frame quand un rider lève la tête".
+_PODIUM_TEAM: dict = {
+    "team_code": None,
+    "highlight_bib": None,
+    "last_seen_s": 0.0,
+    "challenger": None,
+    "challenger_since": 0.0,
+    "display_x": None,
+    "display_y": None,
+}
+
+
+def _pick_team_majority(placeable, now_s):
+    """Met à jour _PODIUM_TEAM et retourne (team_code, highlight_bib).
+
+    Compte les apparitions par team_code parmi les tracks reconnus dans
+    _RIDERS_META. Le sticky empêche le ping-pong : on ne switche que si
+    le challenger reste majoritaire ≥ TEAM_ROSTER_STICKY_S secondes.
+    highlight_bib = bib d'un rider visible de l'équipe affichée (le
+    premier rencontré → suffit pour signaler visuellement qui est en
+    cadre).
+    """
+    counts: dict[str, int] = {}
+    bib_by_team: dict[str, int] = {}
+    for t in placeable:
+        name = getattr(t, "name", None)
+        if not name:
+            continue
+        meta = _RIDERS_META.get(name)
+        if not meta:
+            continue
+        tc = meta.get("team_code") or ""
+        if not tc:
+            continue
+        counts[tc] = counts.get(tc, 0) + 1
+        if tc not in bib_by_team and isinstance(meta.get("bib"), int):
+            bib_by_team[tc] = meta["bib"]
+    if counts:
+        _PODIUM_TEAM["last_seen_s"] = now_s
+        top_team, _ = max(counts.items(), key=lambda kv: kv[1])
+        cur = _PODIUM_TEAM["team_code"]
+        if cur is None or cur not in counts:
+            # Pas de keeper valide → adopter le top direct.
+            _PODIUM_TEAM["team_code"] = top_team
+            _PODIUM_TEAM["challenger"] = None
+        elif top_team != cur:
+            # Challenger : doit persister STICKY_S avant de prendre la main.
+            if _PODIUM_TEAM["challenger"] != top_team:
+                _PODIUM_TEAM["challenger"] = top_team
+                _PODIUM_TEAM["challenger_since"] = now_s
+            elif now_s - _PODIUM_TEAM["challenger_since"] >= TEAM_ROSTER_STICKY_S:
+                _PODIUM_TEAM["team_code"] = top_team
+                _PODIUM_TEAM["challenger"] = None
+        else:
+            _PODIUM_TEAM["challenger"] = None
+        cur = _PODIUM_TEAM["team_code"]
+        _PODIUM_TEAM["highlight_bib"] = bib_by_team.get(cur)
+    return _PODIUM_TEAM["team_code"], _PODIUM_TEAM["highlight_bib"]
+
+
+def _overlay_team_roster(frame: np.ndarray, placeable,
+                         mask: "np.ndarray | None") -> None:
+    """Compose le tableau compo équipe au-dessus de la tête des riders.
+
+    Position : X centré horizontalement dans le frame, Y = sommet des
+    têtes reconnues (= min y1 parmi les bbox riders connus) − hauteur
+    carte − gap. Si aucun rider n'est positionnable, fallback Y =
+    TEAM_ROSTER_TOP_Y_FRACTION × hauteur frame.
+
+    L'équipe affichée est la plus représentée à l'écran (sticky 2s).
+    Disparaît si plus aucun rider reconnu depuis TEAM_ROSTER_IDLE_HIDE_S.
+    """
+    if not podium_state.is_enabled():
+        _PODIUM_TEAM["display_x"] = None
+        _PODIUM_TEAM["display_y"] = None
+        return
+    if not _TEAM_ROSTERS:
+        return
+    now_s = time.monotonic()
+    team_code, highlight_bib = _pick_team_majority(placeable, now_s)
+    if not team_code:
+        _PODIUM_TEAM["display_x"] = None
+        _PODIUM_TEAM["display_y"] = None
+        return
+    if TEAM_ROSTER_IDLE_HIDE_S > 0:
+        idle = now_s - _PODIUM_TEAM["last_seen_s"]
+        if idle > TEAM_ROSTER_IDLE_HIDE_S:
+            _PODIUM_TEAM["display_x"] = None
+            _PODIUM_TEAM["display_y"] = None
+            return
+    card = render_team_roster_card(team_code, highlight_bib)
+    if card is None:
+        return
+    ch, cw = card.shape[:2]
+    fh, fw = frame.shape[:2]
+    target_x = (fw - cw) // 2
+    # Y cible = au-dessus du sommet le plus haut parmi les riders reconnus.
+    top_y = None
+    for t in placeable:
+        name = getattr(t, "name", None)
+        if not name or name not in _RIDERS_META:
+            continue
+        x1, y1, x2, y2 = t.bbox_xyxy()
+        y1 = int(y1)
+        if top_y is None or y1 < top_y:
+            top_y = y1
+    if top_y is None:
+        target_y = int(fh * TEAM_ROSTER_TOP_Y_FRACTION)
+    else:
+        target_y = top_y - TEAM_ROSTER_GAP_PX - ch
+    # Clamping aux bords du frame avant lissage (= sinon EMA "tire"
+    # vers une position interdite et on voit le tableau migrer).
+    target_y = max(TEAM_ROSTER_MARGIN_PX, target_y)
+    target_x = max(TEAM_ROSTER_MARGIN_PX, target_x)
+    target_x = min(fw - TEAM_ROSTER_MARGIN_PX - cw, target_x)
+
+    # Smoothing : même pattern que les labels rider — snap si saut
+    # énorme (changement de plan), deadzone pour absorber les jitters
+    # 1-2 px, sinon EMA vers la cible.
+    dx_f = _PODIUM_TEAM["display_x"]
+    dy_f = _PODIUM_TEAM["display_y"]
+    if (dx_f is None or dy_f is None
+            or abs(target_x - dx_f) > _LABEL_SNAP_PX
+            or abs(target_y - dy_f) > _LABEL_SNAP_PX):
+        dx_f = float(target_x)
+        dy_f = float(target_y)
+    else:
+        # Deadzone : on garde la position courante si l'écart est sous
+        # le seuil, sur chaque axe indépendamment.
+        if abs(target_x - dx_f) >= _LABEL_TARGET_DEADZONE_PX:
+            dx_f += (target_x - dx_f) * _LABEL_SMOOTH_ALPHA
+        if abs(target_y - dy_f) >= _LABEL_TARGET_DEADZONE_PX:
+            dy_f += (target_y - dy_f) * _LABEL_SMOOTH_ALPHA
+    _PODIUM_TEAM["display_x"] = dx_f
+    _PODIUM_TEAM["display_y"] = dy_f
+    dx_i = int(dx_f)
+    dy_i = int(dy_f)
+
+    # Chroma key fond plateau : le tableau s'efface là où le pixel
+    # n'est PAS proche du gris du fond. Compute UNIQUEMENT sur la ROI
+    # destination du tableau (pas la frame entière) → ~5× moins de
+    # boulot numpy à 1080p, fps préservés.
+    effective_mask = mask
+    if TEAM_ROSTER_CHROMA_KEY:
+        x0 = max(0, dx_i)
+        y0 = max(0, dy_i)
+        x1 = min(fw, dx_i + cw)
+        y1 = min(fh, dy_i + ch)
+        if x1 > x0 and y1 > y0:
+            roi = frame[y0:y1, x0:x1]
+            chroma_roi = _compute_chroma_mask(roi)
+            if (mask is not None
+                    and mask.shape == frame.shape[:2]):
+                rvm_roi = mask[y0:y1, x0:x1]
+                chroma_roi = np.maximum(chroma_roi, rvm_roi)
+            global _PODIUM_CHROMA_SCRATCH
+            if (_PODIUM_CHROMA_SCRATCH is None
+                    or _PODIUM_CHROMA_SCRATCH.shape != (fh, fw)):
+                _PODIUM_CHROMA_SCRATCH = np.zeros((fh, fw), dtype=np.uint8)
+            _PODIUM_CHROMA_SCRATCH[y0:y1, x0:x1] = chroma_roi
+            effective_mask = _PODIUM_CHROMA_SCRATCH
+    composite_bgra(frame, card, dx_i, dy_i, mask=effective_mask)
+
+
 def draw_tracks(frame: np.ndarray, tracks,
                 bodies: list[dict] | None = None,
                 mask: "np.ndarray | None" = None) -> None:
@@ -3568,15 +4163,18 @@ def draw_tracks(frame: np.ndarray, tracks,
     # source du stutter. Placement direct au centre du visage, aucun
     # EMA, deadzone, stack, flip, dédup IoU, ni warp. Toggle via env
     # LABEL_RAW_PLACEMENT=1 (2026-05-29 debug session).
+    draw_labels = layout_state.mode() != "none"
     if int(env("LABEL_RAW_PLACEMENT", "1")):
-        for t in placeable:
-            x1, y1, x2, y2 = (int(v) for v in t.bbox_xyxy())
-            lh, lw = t.label_img.shape[:2]
-            dx = (x1 + x2) // 2 - lw // 2
-            dy = y1 - lh - 18  # au-dessus du visage, gap fixe
-            if dy < 0:
-                dy = y2 + 18  # flip dessous si hors cadre
-            composite_bgra(frame, t.label_img, dx, dy, mask=mask)
+        if draw_labels:
+            for t in placeable:
+                x1, y1, x2, y2 = (int(v) for v in t.bbox_xyxy())
+                lh, lw = t.label_img.shape[:2]
+                dx = (x1 + x2) // 2 - lw // 2
+                dy = y1 - lh - 18  # au-dessus du visage, gap fixe
+                if dy < 0:
+                    dy = y2 + 18  # flip dessous si hors cadre
+                composite_bgra(frame, t.label_img, dx, dy, mask=mask)
+        _overlay_team_roster(frame, placeable, mask)
         return
 
     # Dédup par nom + centrage SUPPRIMÉ (2026-05-29) : la distance-au-
@@ -3773,7 +4371,10 @@ def draw_tracks(frame: np.ndarray, tracks,
 
         dx, dy = int(t.display_x), int(t.display_y)
         placed_by_id[t.id] = (dx, dy, dx + lw, dy + lh)
-        composite_bgra(frame, label_to_draw, dx, dy, mask=mask)
+        if draw_labels:
+            composite_bgra(frame, label_to_draw, dx, dy, mask=mask)
+
+    _overlay_team_roster(frame, placeable, mask)
 
 
 _stats_last_det_count = 0  # snapshot précédent du cumul détections worker
@@ -4425,6 +5026,21 @@ class MJPEGHandler(BaseHTTPRequestHandler):
             self.send_header("Content-Length", str(len(body)))
             self.end_headers()
             self.wfile.write(body)
+        elif self.path == "/podium-mode":
+            body = (f'{{"enabled":{str(podium_state.is_enabled()).lower()}}}\n'
+                    ).encode()
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+        elif self.path == "/layout":
+            body = f'{{"mode":"{layout_state.mode()}"}}\n'.encode()
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
         else:
             self.send_response(404)
             self.end_headers()
@@ -4472,6 +5088,7 @@ class MJPEGHandler(BaseHTTPRequestHandler):
   <span class="meta">Source : NDI / UDP HEVC depuis studio</span>
   <span class="meta">·</span>
   <span class="meta">Modèle : InsightFace buffalo_l (RetinaFace + ArcFace) sur RTX 3080</span>
+  <button id="podium-btn" onclick="togglePodium()" title="Affiche le tableau compo équipe au-dessus du flux (équipe majoritaire à l'écran)">⛶ Compo équipe</button>
   <button id="skel-btn" onclick="toggleSkeleton(this)" title="Bascule entre flux vidéo annoté et fond noir + squelettes + photos">⛶ Skeleton</button>
   <button onclick="fs()" title="Plein écran (Esc pour sortir)">⛶ Plein écran</button>
 </header>
@@ -4503,6 +5120,24 @@ class MJPEGHandler(BaseHTTPRequestHandler):
     img.src = (on ? SKEL_SRC : VIDEO_SRC) + sep;
     refreshSkeletonBtn(on);
   }
+  function refreshPodiumBtn(enabled) {
+    var btn = document.getElementById('podium-btn');
+    if (!btn) return;
+    btn.textContent = enabled ? '◼ Compo équipe ON' : '⛶ Compo équipe';
+    btn.style.background = enabled ? '#3d2a4a' : '#21262d';
+    btn.style.borderColor = enabled ? '#a371f7' : '#30363d';
+  }
+  function togglePodium() {
+    fetch('/podium-mode/toggle', { method: 'POST' })
+      .then(function (r) { return r.json(); })
+      .then(function (j) { refreshPodiumBtn(!!j.enabled); })
+      .catch(function () { /* silent */ });
+  }
+  // Sync initial du bouton avec l'état serveur au chargement.
+  fetch('/podium-mode')
+    .then(function (r) { return r.json(); })
+    .then(function (j) { refreshPodiumBtn(!!j.enabled); })
+    .catch(function () { /* silent */ });
 </script>
 </body>
 </html>""".encode("utf-8")
@@ -4535,6 +5170,72 @@ class MJPEGHandler(BaseHTTPRequestHandler):
                 body = f'{{"ok":true,"paused":{str(cw.is_paused()).lower()}}}'.encode()
                 code = 200
             self.send_response(code)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            try:
+                self.wfile.write(body)
+            except (BrokenPipeError, ConnectionResetError):
+                pass
+            return
+        if self.path in ("/layout", "/layout/toggle"):
+            if self.path == "/layout/toggle":
+                new_mode = layout_state.toggle()
+            else:
+                # Mode via query (?mode=solo|none) ou body JSON {"mode": ...}.
+                from urllib.parse import urlparse, parse_qs
+                qs = parse_qs(urlparse(self.path).query)
+                mode_val = None
+                if "mode" in qs and qs["mode"]:
+                    mode_val = qs["mode"][0]
+                if mode_val is None:
+                    length = 0
+                    try:
+                        length = int(self.headers.get("Content-Length") or 0)
+                    except ValueError:
+                        length = 0
+                    raw = self.rfile.read(length) if length > 0 else b""
+                    try:
+                        if raw:
+                            data = json.loads(raw)
+                            if isinstance(data, dict) and "mode" in data:
+                                mode_val = data["mode"]
+                    except (json.JSONDecodeError, ValueError):
+                        mode_val = None
+                if mode_val is None:
+                    mode_val = "solo"
+                new_mode = layout_state.set_mode(str(mode_val))
+            body = f'{{"ok":true,"mode":"{new_mode}"}}'.encode()
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            try:
+                self.wfile.write(body)
+            except (BrokenPipeError, ConnectionResetError):
+                pass
+            return
+        if self.path in ("/podium-mode", "/podium-mode/toggle"):
+            if self.path == "/podium-mode/toggle":
+                new_val = podium_state.toggle()
+            else:
+                length = 0
+                try:
+                    length = int(self.headers.get("Content-Length") or 0)
+                except ValueError:
+                    length = 0
+                raw = self.rfile.read(length) if length > 0 else b""
+                on_val = True
+                try:
+                    if raw:
+                        data = json.loads(raw)
+                        if isinstance(data, dict) and "on" in data:
+                            on_val = bool(data["on"])
+                except (json.JSONDecodeError, ValueError):
+                    on_val = True
+                new_val = podium_state.set_enabled(on_val)
+            body = f'{{"ok":true,"enabled":{str(new_val).lower()}}}'.encode()
+            self.send_response(200)
             self.send_header("Content-Type", "application/json")
             self.send_header("Content-Length", str(len(body)))
             self.end_headers()
@@ -4612,7 +5313,7 @@ def main() -> None:
             f"sans nom (run index_faces.py d'abord)")
 
     # Méta riders (bib + nationalité) depuis le JSON partants ASO.
-    global _RIDERS_META, _NAME_TO_UCIID
+    global _RIDERS_META, _NAME_TO_UCIID, _TEAM_ROSTERS
     _RIDERS_META = load_riders_meta(PARTANTS_JSON)
     if _RIDERS_META:
         log(f"partants chargés : {len(_RIDERS_META)} riders depuis "
@@ -4620,6 +5321,13 @@ def main() -> None:
     else:
         log(f"partants JSON absent/vide ({PARTANTS_JSON}) — labels sans "
             f"bib ni nationalité")
+
+    # Rosters par équipe pour le tableau compo (mode podium).
+    _TEAM_ROSTERS = load_team_rosters(PARTANTS_JSON)
+    if _TEAM_ROSTERS:
+        log(f"team rosters chargés : {len(_TEAM_ROSTERS)} équipes")
+    else:
+        log("team rosters vides — tableau compo équipe désactivé")
 
     # Map name → uciid (pour le lookup photo, plus large que partants).
     _NAME_TO_UCIID = load_name_to_uciid(RIDER_MANIFEST_JSON)
